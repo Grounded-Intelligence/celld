@@ -1558,6 +1558,7 @@ class DurableObjectStorage {
       this._transactionTail = Promise.resolve();
       this._transactionOwner = "";
       this._activeTransaction = null;
+      this._activeSyncTransaction = null;
       this._syncKvListGeneration = 0;
     }
     this._kv = new SyncKvStorage(this);
@@ -1745,13 +1746,20 @@ class DurableObjectStorage {
     this._assertTransactionActive("transactionSync");
     const root = this._transactionRoot;
     const owner = String(__io_context_id());
+    const activeSync = root._activeSyncTransaction;
+    if (this._transactionDepth === 0 && activeSync?.owner === owner)
+      return activeSync.view.transactionSync(f);
     if (this._transactionDepth === 0 && owner !== "" &&
         root._transactionOwner === owner && root._activeTransaction !== null)
       return root._activeTransaction.transactionSync(f);
     const savepoint = this._transactionStart();
     const control = this._newTransactionControl(savepoint);
+    const view = this._transactionView(control);
+    const previousActive = root._activeSyncTransaction;
+    // Async transactions retain their scheduling across a synchronous callback.
+    root._activeSyncTransaction = { owner, view };
     try {
-      const value = f(this._transactionView(control));
+      const value = f(view);
       if (!control.rolledBack) {
         this._transactionCommit(savepoint);
         control.committed = true;
@@ -1767,6 +1775,8 @@ class DurableObjectStorage {
         }
       }
       throw error;
+    } finally {
+      root._activeSyncTransaction = previousActive;
     }
   }
   _newTransactionControl(savepoint) {
