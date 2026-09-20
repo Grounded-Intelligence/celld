@@ -422,12 +422,9 @@ pub enum Channel {
     Response,
     /// `fetch()` from a handler to a third party.
     Fetch,
-    /// A frame from a `webSocketMessage` handler, captured by the host and
-    /// released from the cell's barrier queue.
+    /// Output on a hibernatable socket, including its handler's final write barrier.
     WsHibernatable,
-    /// A frame on a socket the isolate opened and polls itself. It cannot be
-    /// captured, because the handler may be awaiting the reply to the very
-    /// frame being held, so it waits on a durability ticket instead.
+    /// A frame on a socket the isolate opened and polls itself.
     WsSelf,
     /// A service-binding call, `env.NAME.fetch()` or its RPC form.
     Service,

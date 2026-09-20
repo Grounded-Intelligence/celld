@@ -8,6 +8,7 @@
 //! is attached to. Frames emitted inside an output-gate region are held
 //! until the gate opens, which is why emitting is not simply a send.
 use super::*;
+use std::collections::VecDeque;
 
 /// Outbound WebSocket traffic from a DO's `ws.send`/`ws.close`. The host holds
 /// the socket in a task decoupled from the isolate (so the cell can hibernate
@@ -18,13 +19,8 @@ pub enum WsOut {
     Close(u16, String),
 }
 
-/// The result of delivering one `webSocketMessage`. `frames` are the outbound
-/// frames the handler produced, captured by the output gate; `write_position`
-/// is the cell's committed-write count after the handler when it advanced past
-/// where it stood before — i.e. the handler wrote, and its frames must be held
-/// until that position is durable. `None` means no write: flush the frames.
+/// The storage positions observed when a WebSocket handler completes.
 pub struct WsDispatch {
-    pub frames: Vec<(u64, WsOut)>,
     pub write_position: Option<u64>,
     /// As on `HttpResponse`: what a handler that wrote nothing observed above
     /// the cell's published baseline, for the gate to hold its frames behind
@@ -420,6 +416,7 @@ pub struct WsRegistry {
     outputs: HashMap<u64, tokio::sync::mpsc::UnboundedSender<WsOut>>,
     pub metadata: HashMap<u64, WsMeta>,
     worker_handoffs: HashMap<u64, WsPullSender>,
+    closed: HashSet<u64>,
 }
 impl WsRegistry {
     #[doc(hidden)]
@@ -434,11 +431,23 @@ impl WsRegistry {
 
     fn unregister(&mut self, id: u64) -> Option<WsMeta> {
         self.outputs.remove(&id);
+        self.closed.remove(&id);
         self.metadata.remove(&id)
+    }
+
+    fn is_open(&self, id: u64) -> bool {
+        !self.closed.contains(&id)
+            && (self.outputs.contains_key(&id) || self.metadata.contains_key(&id))
     }
 
     #[doc(hidden)]
     pub fn emit(&mut self, id: u64, out: WsOut) {
+        if self.closed.contains(&id) {
+            return;
+        }
+        if matches!(out, WsOut::Close(..)) && self.is_open(id) {
+            self.closed.insert(id);
+        }
         if let Some(tx) = self.outputs.get(&id) {
             tracing::debug!(ws_id = id, "queued outbound WebSocket frame");
             let _ = tx.send(out);
@@ -615,42 +624,17 @@ pub fn ws_register_outbound(id: u64, scope: &str) {
     }
 }
 pub fn ws_unregister(id: u64) {
+    let flush = ws_flush_state();
+    let mut deferred = flush.deferred.lock().unwrap();
+    deferred.remove(&id);
     let meta = ws_registry().lock().unwrap().unregister(id);
+    drop(deferred);
     if let Some(meta) = meta.filter(|meta| !meta.hibernatable) {
         decrement_regular_ws(&meta.scope);
     }
 }
 
-pub(super) fn ws_capture_begin() {
-    current_context()
-        .ws_capture
-        .lock()
-        .unwrap()
-        .push(Vec::new());
-}
-
-pub(super) fn ws_capture_take() -> Vec<(u64, WsOut)> {
-    current_context()
-        .ws_capture
-        .lock()
-        .unwrap()
-        .pop()
-        .unwrap_or_default()
-}
-
-/// Which channel a frame on this socket leaves by.
-///
-/// A hibernatable transport is `WsHibernatable`: the host pushes its messages
-/// into the cell, captures what the handler emits, and releases the batch from
-/// the cell's barrier queue.
-///
-/// A socket the isolate opened and polls itself is `WsSelf`, and the two are
-/// separate channels in the model for a concrete reason. That handler runs
-/// inside the isolate's event loop, and that loop is what a captured frame
-/// would be waiting on: the reply to a frame the gate is withholding never
-/// arrives, so the loop never finishes, so the frame is never released. It
-/// takes a durability ticket on the host runtime instead, which is a different
-/// way of being held rather than not being held at all.
+/// The transport channel used to account for a socket's durability checks.
 fn ws_channel(id: u64) -> celld_logic::Channel {
     let registry = ws_registry();
     let registry = registry.lock().unwrap();
@@ -665,110 +649,92 @@ fn ws_channel(id: u64) -> celld_logic::Channel {
     }
 }
 
-/// The frames one instance holds behind its output gates, and the flushes
-/// that own them.
-///
-/// The three fields are one invariant, so they are one value: a socket has a
-/// queue exactly while a flush counted in `flushes` will drain it, and a
-/// count that falls must notify `done`. Held together, no caller can take the
-/// queue of one instance of the services and the count of another.
+struct WsQueuedFrame {
+    out: WsOut,
+    ready: Arc<OnceLock<bool>>,
+}
+
+impl WsQueuedFrame {
+    fn ready(out: WsOut) -> Self {
+        Self {
+            out,
+            ready: Arc::new(OnceLock::from(true)),
+        }
+    }
+}
+
+/// Frames and durability checks owned by one host instance.
 #[derive(Default)]
 struct WsFlushState {
-    /// Frames held back because the handler that produced them has written
-    /// something not yet durable, one queue per socket.
-    ///
-    /// A socket with a queue has a flush already scheduled, and every later
-    /// frame for that socket joins the queue rather than overtaking it: a
-    /// socket's frames must arrive in the order the script sent them.
-    /// Ordering is a property of one socket, which is what the key says.
-    ///
-    /// Owned by the services, not by a thread. It is filled inside the
-    /// isolate and drained by an op, and an op runs on the host runtime — so
-    /// a thread-local queue was filled on one thread and taken, empty, on
-    /// another. The frames never left the process, and because the queue
-    /// stayed non-empty every later frame joined them.
-    deferred: std::sync::Mutex<HashMap<u64, Vec<WsOut>>>,
-    /// How many flushes still hold frames for a socket. A count, not a flag:
-    /// one flush can finish and drain its queue while a later frame starts
-    /// another.
+    deferred: std::sync::Mutex<HashMap<u64, VecDeque<WsQueuedFrame>>>,
     flushes: std::sync::Mutex<HashMap<u64, usize>>,
     done: tokio::sync::Notify,
 }
 
 impl WsFlushState {
-    /// Send `out` on `id`, or hold it behind the socket's gate.
-    ///
-    /// `gated` is the core's answer for this frame's event. A socket that
-    /// already holds frames joins them whatever that answer is, so a later
-    /// frame cannot overtake an earlier one.
-    ///
-    /// Returns the guard for the flush this frame started, and only then, so
-    /// the caller cannot spawn a second flush for a queue that already has
-    /// one and cannot spawn none for a queue that has none. The count is
-    /// taken while the queue lock is held: a teardown that reads the count
-    /// must not observe a queued frame with no flush behind it.
+    /// Enqueue a frame and retain its own durability check.
     fn emit_or_defer(
         self: &Arc<Self>,
-        registry: &std::sync::Mutex<WsRegistry>,
+        registry: &Arc<std::sync::Mutex<WsRegistry>>,
         id: u64,
         out: WsOut,
         gated: bool,
     ) -> Option<WsFlushGuard> {
-        // Held until this frame is either queued or sent. A flush runs on
-        // another thread, so releasing between the check and the send would
-        // let it drain its queue in between, putting a later frame ahead of
-        // an earlier one.
         let mut deferred = self.deferred.lock().unwrap();
-        let already_deferring = deferred.contains_key(&id);
-        if !gated && !already_deferring {
+        if !registry.lock().unwrap().is_open(id) {
+            return None;
+        }
+        if !gated {
             ws_emit_ordered(&mut deferred, registry, std::iter::once((id, out)));
             return None;
         }
-        deferred.entry(id).or_default().push(out);
-        (!already_deferring).then(|| {
-            *self.flushes.lock().unwrap().entry(id).or_default() += 1;
-            WsFlushGuard {
-                state: self.clone(),
-                id,
-            }
+        let ready = Arc::new(OnceLock::new());
+        deferred.entry(id).or_default().push_back(WsQueuedFrame {
+            out,
+            ready: ready.clone(),
+        });
+        *self.flushes.lock().unwrap().entry(id).or_default() += 1;
+        Some(WsFlushGuard {
+            state: self.clone(),
+            registry: registry.clone(),
+            id,
+            ready,
         })
     }
 
-    /// Release the frames one flush held, or replace them with a close.
-    ///
-    /// `held` is what the gate answered. `Err` means the frames describe a
-    /// write the fleet may never have, so they must not be delivered.
-    /// Dropping them and leaving the socket open is not an option -- a
-    /// WebSocket is an ordered stream, and a peer cannot see a hole in one.
-    /// It would read the frames on either side of the gap as consecutive.
-    ///
-    /// Close instead. A truncated stream is something the peer can detect and
-    /// resynchronise from; a silently incomplete one is not. The cell is
-    /// reset underneath this as well, but that is a separate path and this
-    /// must not depend on its timing.
-    fn release(&self, registry: &std::sync::Mutex<WsRegistry>, id: u64, held: Result<(), String>) {
-        // Keep the lock from removal through the registry send. Once the
-        // entry is absent, another release would otherwise look direct and
-        // overtake these frames.
+    /// Release only the consecutive frames whose own checks succeeded.
+    fn release(
+        &self,
+        registry: &std::sync::Mutex<WsRegistry>,
+        id: u64,
+        ready: &OnceLock<bool>,
+        ok: bool,
+    ) {
         let mut deferred = self.deferred.lock().unwrap();
-        let frames = deferred.remove(&id).unwrap_or_default();
-        match held {
-            Err(_) => ws_emit_ordered(
-                &mut deferred,
-                registry,
-                std::iter::once((
-                    id,
-                    WsOut::Close(
-                        1011,
-                        "celld could not prove the write behind this message durable".to_string(),
-                    ),
-                )),
-            ),
-            Ok(()) => ws_emit_ordered(
-                &mut deferred,
-                registry,
-                frames.into_iter().map(|out| (id, out)),
-            ),
+        let _ = ready.set(ok);
+        let Some(queue) = deferred.get_mut(&id) else {
+            return;
+        };
+        let mut registry = registry.lock().unwrap();
+        if !ok {
+            deferred.remove(&id);
+            registry.emit(
+                id,
+                WsOut::Close(
+                    1011,
+                    "celld could not prove the write behind this message durable".to_string(),
+                ),
+            );
+            return;
+        }
+        while queue
+            .front()
+            .is_some_and(|frame| frame.ready.get() == Some(&true))
+        {
+            registry.emit(id, queue.pop_front().unwrap().out);
+        }
+        if queue.is_empty() || !registry.is_open(id) {
+            deferred.remove(&id);
         }
     }
 
@@ -824,9 +790,7 @@ fn ws_flush_state() -> Arc<WsFlushState> {
 #[doc(hidden)]
 pub struct WsHeldFlush(WsFlushGuard);
 
-/// Hold `out` behind `id`'s gate exactly as a gated frame does, and return
-/// the flush the frame started. `None` when the socket already holds frames,
-/// because then an earlier flush owns the queue.
+/// Hold one frame until its own durability check settles.
 #[cfg(celld_internal_tests)]
 #[doc(hidden)]
 pub fn ws_defer_frame(id: u64, out: WsOut) -> Option<WsHeldFlush> {
@@ -846,7 +810,7 @@ pub fn ws_deferred_count(id: u64) -> usize {
         .lock()
         .unwrap()
         .get(&id)
-        .map_or(0, Vec::len)
+        .map_or(0, VecDeque::len)
 }
 
 /// Release a held flush as a settled durability ticket does, then count it
@@ -854,27 +818,30 @@ pub fn ws_deferred_count(id: u64) -> usize {
 #[cfg(celld_internal_tests)]
 #[doc(hidden)]
 pub fn ws_release_flush(held: WsHeldFlush) {
-    let registry = ws_registry();
-    held.0.state.release(&registry, held.0.id, Ok(()));
+    held.0.complete(Ok(()));
 }
 
-/// Counts one flush out on every exit path, including the ones that run no
-/// code: a flush spawned onto a runtime that is already shutting down is
-/// dropped unpolled, and a panic unwinds through it. A count left behind by
-/// either would park the socket's teardown. Held by the flush, so the count
-/// falls whether it finished, failed, or never ran. It cannot help a flush
-/// that is merely parked -- nothing drops, so nothing runs -- which is what
-/// the teardown wait is bounded for.
-///
-/// It carries the state rather than resolving it on drop, because the drop
-/// can run on a runtime that answers with another instance, or with none.
+/// Owns one frame's check through completion or cancellation.
 struct WsFlushGuard {
     state: Arc<WsFlushState>,
+    registry: Arc<std::sync::Mutex<WsRegistry>>,
     id: u64,
+    ready: Arc<OnceLock<bool>>,
+}
+
+impl WsFlushGuard {
+    fn complete(self, held: Result<(), String>) {
+        self.state
+            .release(&self.registry, self.id, &self.ready, held.is_ok());
+    }
 }
 
 impl Drop for WsFlushGuard {
     fn drop(&mut self) {
+        if self.ready.get().is_none() {
+            self.state
+                .release(&self.registry, self.id, &self.ready, false);
+        }
         {
             let mut flushes = self.state.flushes.lock().unwrap();
             if let Some(count) = flushes.get_mut(&self.id) {
@@ -913,23 +880,8 @@ pub async fn ws_await_all_flushes() {
     ws_flush_state().await_all_flushes().await;
 }
 
-/// Send or hold one frame. `context` is the event the sending JavaScript
-/// belongs to: the continuation's own for a V8 entry point, so a reaction of
-/// cell A that runs inside another event's checkpoint is captured by and
-/// gated against A, not the checkpoint's owner.
+/// Gate a frame against the event that produced it.
 fn ws_emit(context: &IoContext, id: u64, out: WsOut) {
-    let mut capture = context.ws_capture.lock().unwrap();
-    if !capture.is_empty() && ws_channel(id) == celld_logic::Channel::WsHibernatable {
-        capture.last_mut().unwrap().push((id, out));
-        return;
-    }
-    drop(capture);
-    // A socket the isolate opened itself, which the capture above deliberately
-    // will not hold: releasing captured frames waits for the handler to
-    // return, and this handler may be awaiting a reply to the very frame being
-    // held. Waiting on the DURABILITY ticket instead has no such cycle -- it
-    // is resolved by the replicator, which does not need this event loop -- so
-    // the frame can be held without deadlocking the script that sent it.
     let gate = egress_gate_request(context, ws_channel(id));
     // Resolved here, on the thread the frame was sent from, and moved into the
     // flush below. The flush runs on a runtime that has no services of its
@@ -954,9 +906,8 @@ fn ws_emit(context: &IoContext, id: u64, out: WsOut) {
     // request driver stops polling its operation future the moment the
     // dispatch returns. Either way the frames never left the process.
     asyncrt::op_handle().spawn(async move {
-        let _counted = counted;
         let held = await_egress_gate(gate).await;
-        flush.release(&registry, id, held);
+        counted.complete(held);
     });
 }
 
@@ -970,14 +921,17 @@ fn ws_emit(context: &IoContext, id: u64, out: WsOut) {
 /// parameter for the same reason the queue is: both must come from the
 /// instance that owns the socket, and a flush cannot look either up.
 fn ws_emit_ordered(
-    deferred: &mut HashMap<u64, Vec<WsOut>>,
+    deferred: &mut HashMap<u64, VecDeque<WsQueuedFrame>>,
     registry: &std::sync::Mutex<WsRegistry>,
     frames: impl IntoIterator<Item = (u64, WsOut)>,
 ) {
     let mut registry = registry.lock().unwrap();
     for (id, out) in frames {
+        if !registry.is_open(id) {
+            continue;
+        }
         match deferred.get_mut(&id) {
-            Some(queue) => queue.push(out),
+            Some(queue) => queue.push_back(WsQueuedFrame::ready(out)),
             None => registry.emit(id, out),
         }
     }
@@ -1544,3 +1498,7 @@ pub(super) fn op_ws_auto_response_ts(
         None => rv.set(v8::null(scope).into()),
     }
 }
+
+#[cfg(test)]
+#[path = "websocket_output_tests.rs"]
+mod output_tests;

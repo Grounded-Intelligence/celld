@@ -3015,9 +3015,9 @@ fn fetch_request_error(error: &reqwest::Error) -> String {
 
 #[doc(hidden)]
 pub mod websocket;
+use websocket::ws_close_request_sockets;
 pub(crate) use websocket::WebSocketService;
 pub use websocket::*;
-use websocket::{ws_capture_begin, ws_capture_take, ws_close_request_sockets};
 
 /// What an outbound effect must trail before it leaves the process.
 ///
@@ -5779,7 +5779,6 @@ impl InFlight {
                 let dispatch = self
                     .gate_positions()
                     .map(|(write_position, observed_position)| WsDispatch {
-                        frames: ws_capture_take(),
                         write_position,
                         observed_position,
                     });
@@ -7588,7 +7587,6 @@ fn start_cell_event<'s>(
     answer: Answer,
     request_id: Option<RequestId>,
     body_stream_id: Option<u64>,
-    capture_frames: bool,
     call: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>>,
 ) -> Begun {
     let runtime_state = actor_runtime_state(tc);
@@ -7613,9 +7611,6 @@ fn start_cell_event<'s>(
         // one without the other.
         root: storage::embedded_root_gate(scope),
     });
-    if capture_frames {
-        ws_capture_begin();
-    }
     let event_started = Instant::now();
     let started = (|| {
         begin_event_context(tc)?;
@@ -7743,7 +7738,6 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 Answer::Fetch(reply),
                 request_id,
                 body_stream_id,
-                false,
                 |tc| {
                     let f = internal_function(tc, "__dispatchTo")?;
                     // A held body crosses as its bytes; a streamed body crosses as
@@ -7790,32 +7784,24 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
                 let _ = reply.send(Err(error));
                 return Begun::Nothing;
             }
-            start_cell_event(
-                tc,
-                &scope,
-                Answer::CellRpc(reply),
-                request_id,
-                None,
-                false,
-                |tc| {
-                    let f = internal_function(tc, "__dispatchRpc")?;
-                    let arguments = [
-                        v8::String::new(tc, &scope).unwrap().into(),
-                        v8::String::new(tc, &method).unwrap().into(),
-                        rpc_data_value(tc, args),
-                    ];
-                    let recv = v8::undefined(tc).into();
-                    f.call(tc, recv, &arguments)
-                        .ok_or_else(|| anyhow!("dispatchRpc threw"))
-                },
-            )
+            start_cell_event(tc, &scope, Answer::CellRpc(reply), request_id, None, |tc| {
+                let f = internal_function(tc, "__dispatchRpc")?;
+                let arguments = [
+                    v8::String::new(tc, &scope).unwrap().into(),
+                    v8::String::new(tc, &method).unwrap().into(),
+                    rpc_data_value(tc, args),
+                ];
+                let recv = v8::undefined(tc).into();
+                f.call(tc, recv, &arguments)
+                    .ok_or_else(|| anyhow!("dispatchRpc threw"))
+            })
         }
         CellJob::WsOpen {
             scope,
             ws_id,
             protocol,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, |tc| {
             let f = internal_function(tc, "__wsOpen")?;
             let arguments = [
                 v8::String::new(tc, &scope).unwrap().into(),
@@ -7831,29 +7817,21 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             ws_id,
             data,
             reply,
-        } => start_cell_event(
-            tc,
-            &scope,
-            Answer::WsMessage(reply),
-            None,
-            None,
-            true,
-            |tc| {
-                let (name, data) = match data {
-                    WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
-                    WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
-                };
-                let f = internal_function(tc, name)?;
-                let arguments = [
-                    v8::String::new(tc, &scope).unwrap().into(),
-                    v8::Number::new(tc, ws_id as f64).into(),
-                    data,
-                ];
-                let recv = v8::undefined(tc).into();
-                f.call(tc, recv, &arguments)
-                    .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
-            },
-        ),
+        } => start_cell_event(tc, &scope, Answer::WsMessage(reply), None, None, |tc| {
+            let (name, data) = match data {
+                WsIn::Text(text) => ("__wsMessage", v8::String::new(tc, &text).unwrap().into()),
+                WsIn::Binary(bytes) => ("__wsBinary", bytes_value(tc, bytes)),
+            };
+            let f = internal_function(tc, name)?;
+            let arguments = [
+                v8::String::new(tc, &scope).unwrap().into(),
+                v8::Number::new(tc, ws_id as f64).into(),
+                data,
+            ];
+            let recv = v8::undefined(tc).into();
+            f.call(tc, recv, &arguments)
+                .ok_or_else(|| anyhow!("WebSocket message dispatch threw"))
+        }),
         CellJob::WsClosed {
             scope,
             ws_id,
@@ -7861,7 +7839,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             reason,
             was_clean,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, |tc| {
             let f = internal_function(tc, "__wsClosed")?;
             let arguments = [
                 v8::String::new(tc, &scope).unwrap().into(),
@@ -7896,7 +7874,7 @@ fn begin_cell(tc: &mut v8::PinScope, job: CellJob, event_time: i64) -> Begun {
             socket_id,
             terminate,
             reply,
-        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, false, |tc| {
+        } => start_cell_event(tc, &scope, Answer::Ack(reply), None, None, |tc| {
             register_arm_gate_with_current_event(gate, installed_context());
             if let Some(socket_id) = socket_id {
                 current_context().sockets.lock().unwrap().push(socket_id);
@@ -7980,25 +7958,17 @@ fn fire_alarm_handler(
     request_id: Option<RequestId>,
     reply: tokio::sync::oneshot::Sender<Result<(celld_logic::wake::AlarmSnapshot, Option<u64>)>>,
 ) -> Begun {
-    let begun = start_cell_event(
-        tc,
-        scope,
-        Answer::Alarm(reply),
-        request_id,
-        None,
-        false,
-        |tc| {
-            let f = internal_function(tc, "__fireAlarm")?;
-            let arguments = [
-                v8::String::new(tc, scope).unwrap().into(),
-                v8::Number::new(tc, scheduled_at as f64).into(),
-                v8::Number::new(tc, retry as f64).into(),
-            ];
-            let recv = v8::undefined(tc).into();
-            f.call(tc, recv, &arguments)
-                .ok_or_else(|| anyhow!("alarm threw"))
-        },
-    );
+    let begun = start_cell_event(tc, scope, Answer::Alarm(reply), request_id, None, |tc| {
+        let f = internal_function(tc, "__fireAlarm")?;
+        let arguments = [
+            v8::String::new(tc, scope).unwrap().into(),
+            v8::Number::new(tc, scheduled_at as f64).into(),
+            v8::Number::new(tc, retry as f64).into(),
+        ];
+        let recv = v8::undefined(tc).into();
+        f.call(tc, recv, &arguments)
+            .ok_or_else(|| anyhow!("alarm threw"))
+    });
     match begun {
         Begun::Running(mut entry) => {
             entry.alarm = claim;
@@ -13815,15 +13785,6 @@ pub struct IoContext {
     /// an id out before its target takes ownership, so only one request can
     /// reclaim an unread tail.
     body_streams: Mutex<HashMap<u64, HttpStreamClaim>>,
-    /// Output-gate capture. While a `webSocketMessage` runs, the frames it
-    /// sends are collected here instead of reaching the wire, so the shell
-    /// can hold them until the message's write is durable. A stack, so a
-    /// nested dispatch keeps its frames apart from the outer one's.
-    ///
-    /// On the event and not on the thread, because an event outlives the
-    /// turn that began it: capture starts in one turn and is taken in a
-    /// later one, which tokio may run on a different worker.
-    ws_capture: Mutex<Vec<Vec<(u64, WsOut)>>>,
     /// What each running event's outbound effects gate against, innermost
     /// last. An outbound effect raised during the event consults this: if the
     /// handler has advanced the position, the effect waits for the output gate
@@ -14036,7 +13997,6 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
-            ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
@@ -14068,7 +14028,6 @@ impl IoContext {
             input_gates: Mutex::new(InputGateClaims::default()),
             cross_entry_gates: CrossEntryGateClaims::default(),
             body_streams: Mutex::new(HashMap::new()),
-            ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
