@@ -43,7 +43,6 @@ async fn dispatch_ws_message(
         // successful writer's batch opens, with no frames behind it: the
         // commit is as unproven either way, and a read-only batch or response
         // that followed would otherwise trail nothing and reveal it (#715).
-        // The frames it captured before it failed are dropped, as before.
         Err(error) => {
             if let Some(position) = celld::js::failed_write_position(&error) {
                 // The barrier is registered before the activity guard
@@ -61,14 +60,13 @@ async fn dispatch_ws_message(
             return Err(error);
         }
     };
-    // A read-only frame can reveal another event's unproven write, so all
-    // captured frames pass through the cell's barrier queue before emission.
-    if !dispatch.frames.is_empty() || dispatch.write_position.is_some() {
+    // Register final writes even when the handler sent no frames after them.
+    if dispatch.write_position.is_some() {
         if let Err(stopped) = app
             .ws_output(
                 request,
                 scope.to_string(),
-                dispatch.frames,
+                Vec::new(),
                 dispatch.write_position,
                 dispatch.observed_position,
             )
