@@ -171,6 +171,12 @@ pub(super) fn op_tcp_connect(
                     request.hostname, request.port
                 )
             })?;
+        crate::tcp_keepalive::enable(&stream).map_err(|error| {
+            format!(
+                "TCP keepalive for {}:{} failed: {error}",
+                request.hostname, request.port
+            )
+        })?;
         let remote = stream.peer_addr().map(|a| a.to_string()).ok();
         let local = stream.local_addr().map(|a| a.to_string()).ok();
         let mut stream: Duplex = Box::new(stream);
