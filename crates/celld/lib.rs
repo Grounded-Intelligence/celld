@@ -366,6 +366,7 @@ pub mod replication;
 pub mod runtime;
 pub mod startup;
 pub mod storage;
+pub mod tcp_keepalive;
 pub mod telemetry;
 pub mod wake;
 pub mod wake_format;
