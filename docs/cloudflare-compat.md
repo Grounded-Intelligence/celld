@@ -148,6 +148,8 @@ execution.
 - `KeyObject.toCryptoKey()` applies the requested algorithm, extractability,
   and usages to an asymmetric key.
 - `node:zlib` implements only the synchronous gzip and deflate functions.
+- `node:net` implements only `isIP`, `isIPv4`, and `isIPv6`. A Worker opens
+  sockets through `cloudflare:sockets`.
 - `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`, and
   `readFile`. It exposes an empty, request-local `/tmp` and a read-only
   `/bundle` that contains the Worker modules.
