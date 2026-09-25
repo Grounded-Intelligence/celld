@@ -12271,7 +12271,9 @@ const __fsPromisesSurface = {
 // keeps default and named imports loud but silently omits these names from a
 // namespace. Keep the unsupported names lazy: materializing every stub in
 // every isolate would charge Workers that use only the implemented subset.
-const __fsNamespaceProxy = (surface, path, names, enoentNames = []) => {
+const __partialNamespace = __celld.__partialNamespace = (
+  surface, path, names, enoentNames = [],
+) => {
   const namespaceNames = new Set([...Reflect.ownKeys(surface), ...names]);
   const enoentNameSet = new Set(enoentNames);
   return new Proxy(surface, {
@@ -12300,7 +12302,7 @@ const __fsNamespaceProxy = (surface, path, names, enoentNames = []) => {
           : undefined),
   });
 };
-const __fsPromises = __celld.__fsPromises = __fsNamespaceProxy(
+const __fsPromises = __celld.__fsPromises = __partialNamespace(
   __fsPromisesSurface,
   "node:fs/promises",
   [
@@ -12347,7 +12349,7 @@ const __fsNamespaceNames = [
 // Writable file contents and every mutation remain explicit unsupported
 // surfaces until a failing application seam requires them. These two reads
 // use ENOENT so dependencies can take their no-filesystem fallback path.
-__celld.__fs = __fsNamespaceProxy(
+__celld.__fs = __partialNamespace(
   __fsSurface,
   "node:fs",
   __fsNamespaceNames,
