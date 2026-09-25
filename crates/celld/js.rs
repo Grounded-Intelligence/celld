@@ -2976,13 +2976,16 @@ impl CellJob {
 thread_local! {
     // One outbound HTTP client per JS thread — building it per fetch rebuilds
     // the TLS stack every call (async-op-hazards.md).
-    static HTTP: reqwest::Client = reqwest::Client::new();
+    static HTTP: reqwest::Client = reqwest::Client::builder()
+        .tcp_keepalive(crate::tcp_keepalive::IDLE).build().unwrap();
     static HTTP_MANUAL: reqwest::Client = reqwest::Client::builder()
+        .tcp_keepalive(crate::tcp_keepalive::IDLE)
         .redirect(reqwest::redirect::Policy::none()).build().unwrap();
     // A separate policy stops an `error` request before reqwest can replay it
     // at the destination. Inspecting the final response would be too late:
     // the method, body, and credentials could already have left the process.
     static HTTP_ERROR: reqwest::Client = reqwest::Client::builder()
+        .tcp_keepalive(crate::tcp_keepalive::IDLE)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             attempt.error("fetch redirect mode is error")
         })).build().unwrap();
@@ -13901,6 +13904,7 @@ impl IoContext {
             .get_or_init(|| {
                 let context = Arc::downgrade(self);
                 reqwest::Client::builder()
+                    .tcp_keepalive(crate::tcp_keepalive::IDLE)
                     .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                         if attempt.previous().len() >= 10 {
                             return attempt.error("too many redirects");

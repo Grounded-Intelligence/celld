@@ -4153,6 +4153,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         // multi-segment peer body. Peer requests are latency-bound, so the
         // socket must write eagerly.
         .tcp_nodelay(true)
+        .tcp_keepalive(celld::tcp_keepalive::IDLE)
         .build()
         .unwrap();
     let resume_generation = celld::runtime::take_clean_reload_generation(&data_dir, &node);

@@ -124,6 +124,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha1 = "0.10"
 sha2 = "0.10"
+socket2 = "0.6"
 # sqlite-vec is pre-v1, and its Rust binding is outside its compatibility
 # policy. Pin the audited C amalgamation exactly.
 sqlite-vec = "=0.1.9"
