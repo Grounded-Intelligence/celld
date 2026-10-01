@@ -1,6 +1,6 @@
 [package]
 name = "celld"
-version = "0.6.1"
+version = "0.6.1-grounded.1"
 edition = "2021"
 rust-version = "1.94.1"
 license = "Apache-2.0"
@@ -72,6 +72,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+socket2.workspace = true
 subtle.workspace = true
 tempfile.workspace = true
 tikv-jemalloc-ctl.workspace = true

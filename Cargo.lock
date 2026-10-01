@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "celld"
-version = "0.6.1"
+version = "0.6.1-grounded.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -339,6 +339,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "socket2",
  "sqlite-vec",
  "subtle",
  "tempfile",

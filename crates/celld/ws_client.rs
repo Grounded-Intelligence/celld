@@ -135,6 +135,8 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
         .with_context(|| format!("connect {authority}"))?;
+    crate::tcp_keepalive::enable(&tcp)
+        .with_context(|| format!("enable TCP keepalive for {authority}"))?;
     let stream: Box<dyn Stream> = if tls {
         let name = rustls::pki_types::ServerName::try_from(host.clone())
             .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;
