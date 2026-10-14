@@ -422,9 +422,12 @@ pub enum Channel {
     Response,
     /// `fetch()` from a handler to a third party.
     Fetch,
-    /// Output on a hibernatable socket, including its handler's final write barrier.
+    /// A frame from a `webSocketMessage` handler, captured by the host and
+    /// released from the cell's barrier queue.
     WsHibernatable,
-    /// A frame on a socket the isolate opened and polls itself.
+    /// A frame on a socket the isolate opened and polls itself. It cannot be
+    /// captured, because the handler may be awaiting the reply to the very
+    /// frame being held, so it waits on a durability ticket instead.
     WsSelf,
     /// A service-binding call, `env.NAME.fetch()` or its RPC form.
     Service,
@@ -595,6 +598,15 @@ pub enum Event {
         cell: CellId,
         websocket: WebSocketId,
         now_ms: u64,
+        now_mono_ms: u64,
+    },
+    /// The output gate for an effect that work already running on this cell
+    /// raised. Only the cell's own isolate raises one, so it belongs to
+    /// admitted work and must not queue behind a swap that waits for that
+    /// same work to finish.
+    GateRequestAt {
+        request: RequestId,
+        cell: CellId,
         now_mono_ms: u64,
     },
     /// Reserve an idle resident isolate for a top-level Worker request. The
