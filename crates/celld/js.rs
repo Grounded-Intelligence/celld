@@ -3834,28 +3834,24 @@ impl InFlight {
         &self.context
     }
 
-    /// Give an op to the event whose continuation enqueued it.
+    /// Give an op to the event whose continuation enqueued it, or return it
+    /// when that event has retired.
     ///
     /// The owner's driver polls it, so the owner's retirement decides when it
-    /// is cancelled and this event's retirement cannot take it away. An owner
-    /// that is already gone can never run the continuation again, so its
-    /// resolver goes with the op, exactly as `abandon` drops this event's own.
+    /// is cancelled and this event's retirement cannot take it away. A retired
+    /// owner's continuation still runs whenever a later event settles the
+    /// promise it awaits, so its op comes back for the running event to drive
+    /// rather than losing the resolver that continuation waits on.
     fn hand_op(
-        &mut self,
+        &self,
         owner: u64,
         id: u64,
         future: asyncrt::OpFuture,
         lifetime: asyncrt::OpLifetime,
-    ) {
-        // One branch for both refusals — an owner that is already gone, and
-        // one whose mailbox closed while this turn ran. Splitting them let the
-        // second forget to drop the resolver, which is the whole defect.
-        let delivered = self
-            .runtime_state
-            .io_context(owner)
-            .is_some_and(|context| context.hand_op(id, future, lifetime));
-        if !delivered {
-            self.runtime_state.promises.lock().unwrap().remove(&id);
+    ) -> Result<(), HandedOp> {
+        match self.runtime_state.io_context(owner) {
+            Some(context) => context.hand_op(id, future, lifetime),
+            None => Err((id, future, lifetime)),
         }
     }
 
@@ -4076,19 +4072,38 @@ fn op_with_input_gate_context(
         return;
     };
     let previous = scope.get_continuation_preserved_embedder_data();
-    let token = cped_io_context(scope);
     // A nested block inherits its driver's identity, even if a third event
     // runs the checkpoint. A new block uses the entry driving this turn.
-    if !token.is_array() {
-        if let Some(origin) = reaction_continuation_id(scope) {
-            let driver = current_context().continuation_id().unwrap_or(origin);
-            let origin = v8::BigInt::new_from_u64(scope, origin);
-            let driver = v8::BigInt::new_from_u64(scope, driver);
-            let pair = v8::Array::new_with_elements(scope, &[origin.into(), driver.into()]);
-            let frame = cped_frame(scope);
-            let trace = cped_trace(scope);
-            set_cped(scope, frame, trace, pair.into());
+    let nested = cped_io_context(scope).is_array();
+    let pair = reaction_continuation_id(scope).map(|origin| {
+        let driver = if nested {
+            operation_continuation_id(scope)
+        } else {
+            current_context().continuation_id()
+        };
+        (origin, driver.unwrap_or(origin))
+    });
+    // A promise can resume a retired event's continuation during a later
+    // event's checkpoint, and workerd runs it in that event's context, so the
+    // running event takes the block.
+    let live = |scope: &mut v8::PinScope, id| {
+        actor_runtime_state(scope)
+            .io_context(id)
+            .is_some_and(|context| context.accepts_handed_ops())
+    };
+    let pair = match pair {
+        Some((origin, driver)) if !live(scope, origin) || !live(scope, driver) => {
+            current_context().continuation_id().map(|id| (id, id))
         }
+        pair => pair,
+    };
+    if let Some((origin, driver)) = pair {
+        let origin = v8::BigInt::new_from_u64(scope, origin);
+        let driver = v8::BigInt::new_from_u64(scope, driver);
+        let pair = v8::Array::new_with_elements(scope, &[origin.into(), driver.into()]);
+        let frame = cped_frame(scope);
+        let trace = cped_trace(scope);
+        set_cped(scope, frame, trace, pair.into());
     }
     let receiver = v8::undefined(scope).into();
     let result = callback.call(scope, receiver, &[]);
@@ -4477,10 +4492,13 @@ fn adopt(entry: &mut InFlight) -> Vec<Op> {
     let mine = entry.context.continuation_id();
     let mut ops = Vec::with_capacity(spawns.len());
     for (id, future, lifetime, owner) in spawns {
-        if let Some(owner) = owner.filter(|owner| Some(*owner) != mine) {
-            entry.hand_op(owner, id, future, lifetime);
-            continue;
-        }
+        let (id, future, lifetime) = match owner.filter(|owner| Some(*owner) != mine) {
+            Some(owner) => match entry.hand_op(owner, id, future, lifetime) {
+                Ok(()) => continue,
+                Err(op) => op,
+            },
+            None => (id, future, lifetime),
+        };
         entry.ops.insert(id);
         if lifetime == asyncrt::OpLifetime::IoContext {
             entry.io_context_ops.insert(id);
@@ -11256,16 +11274,17 @@ impl IoContext {
         context
     }
 
-    /// Take an op that another event's turn enqueued for this event.
-    ///
-    /// Reports whether the mailbox accepted it. A closed mailbox refuses, and
-    /// the caller must then drop the op's resolver: this event will never run
-    /// the continuation waiting on it.
-    #[must_use]
-    fn hand_op(&self, id: u64, future: asyncrt::OpFuture, lifetime: asyncrt::OpLifetime) -> bool {
+    /// Take an op that another event's turn enqueued for this event, or
+    /// return it when this event's mailbox has closed.
+    fn hand_op(
+        &self,
+        id: u64,
+        future: asyncrt::OpFuture,
+        lifetime: asyncrt::OpLifetime,
+    ) -> Result<(), HandedOp> {
         let mut handed = self.handed.lock().unwrap();
         let Some(queue) = handed.as_mut() else {
-            return false;
+            return Err((id, future, lifetime));
         };
         queue.push((id, future, lifetime));
         // Published under the lock, so a reader that sees this count can take
@@ -11273,7 +11292,7 @@ impl IoContext {
         self.handed_len.store(queue.len(), Ordering::Release);
         drop(handed);
         self.handed_wake.notify_one();
-        true
+        Ok(())
     }
 
     /// Whether a foreign turn has left this event an op, without locking.
@@ -11606,11 +11625,13 @@ impl IoContextRegistryForTest {
     /// only stores it, so nothing here polls it.
     #[doc(hidden)]
     pub fn hand_pending_op(&self, context: &Arc<IoContext>, id: u64) -> bool {
-        context.hand_op(
-            id,
-            Box::pin(std::future::pending()),
-            asyncrt::OpLifetime::Handler,
-        )
+        context
+            .hand_op(
+                id,
+                Box::pin(std::future::pending()),
+                asyncrt::OpLifetime::Handler,
+            )
+            .is_ok()
     }
 
     /// The op ids `context` still holds for a driver that has not taken them.
