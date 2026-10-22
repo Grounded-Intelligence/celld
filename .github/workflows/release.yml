@@ -263,6 +263,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
 
       - name: Resolve and validate the release tag
         run: |

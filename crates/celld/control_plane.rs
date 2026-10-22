@@ -464,7 +464,6 @@ pub async fn handle_token_command(
     if !shell_only {
         // Say what to do next, not merely what happened -- on stderr, so
         // that `eval "$(celld token)"` sees only the exports.
-        note!("Deploy token for this fleet:\n\n  {}\n", issued.token);
         note!("Deploy your app with these exports, then `npx wrangler@4 deploy`:\n");
     }
     crate::cli_output::Output::new(crate::cli_output::Format::Text).bytes(exports.as_bytes())
