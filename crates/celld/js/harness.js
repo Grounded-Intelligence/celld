@@ -2673,7 +2673,7 @@ class DurableObjectState {
         // ticket, but the retired callback must not run.
         if (record.retired) {
           __gate_release(this._scope, event, owner, null);
-          return;
+          throw new Error("the cell event ended before it could acquire an input gate");
         }
         block.holder = event;
         // A critical section that fails resets the actor, so whatever queued
