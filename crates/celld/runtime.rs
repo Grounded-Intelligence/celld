@@ -3502,9 +3502,13 @@ async fn drive_cell_inner(
                 (Vec::new(), Vec::new())
             }
             Wake::Idle => {
-                entry.stuck();
-                slot.turn(|worker| worker.turn_retire_input_gates(&entry))
-                    .await;
+                slot.turn(|worker| {
+                    if !entry.has_live_cross_entry_claim() && !entry.has_refed_ops() {
+                        entry.stuck();
+                        worker.turn_retire_input_gates(&entry);
+                    }
+                })
+                .await;
                 #[cfg(celld_internal_tests)]
                 notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
                 (Vec::new(), Vec::new())

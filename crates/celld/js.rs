@@ -3581,12 +3581,12 @@ impl InFlight {
 
     /// Done when the response is sent and no referenced work remains.
     pub fn finished(&self) -> bool {
-        self.retired() && !self.has_refed_ops()
+        self.retired() && !self.has_refed_ops() && self.context.close_empty_handed_ops()
     }
 
     /// Whether an operation can keep this event alive.
     pub(crate) fn has_refed_ops(&self) -> bool {
-        self.ops != self.unrefed_ops
+        self.ops != self.unrefed_ops || self.context.has_handed_ops()
     }
 
     /// Borrow the reply gate and operation mailbox together. The wake loop
@@ -3709,6 +3709,10 @@ impl InFlight {
     /// Give up on a handler that will not settle.
     pub fn time_out(&mut self, budget: Duration) {
         self.fail(anyhow!("handler exceeded {}s budget", budget.as_secs()));
+    }
+
+    pub(crate) fn has_live_cross_entry_claim(&self) -> bool {
+        self.context.has_cross_entry_gate_claim()
     }
 
     /// Nothing this request awaits can move it, so it will never settle on
@@ -4089,7 +4093,7 @@ fn op_with_input_gate_context(
     let live = |scope: &mut v8::PinScope, id| {
         actor_runtime_state(scope)
             .io_context(id)
-            .is_some_and(|context| context.accepts_handed_ops())
+            .is_some_and(|context| context.accepts_handed_ops() && context.accepts_gate_claims())
     };
     let pair = match pair {
         Some((origin, driver)) if !live(scope, origin) || !live(scope, driver) => {
@@ -9555,7 +9559,9 @@ fn op_io_context_id(
         operation_continuation_id(scope).filter(|id| {
             actor_runtime_state(scope)
                 .io_context(*id)
-                .is_some_and(|context| context.accepts_handed_ops())
+                .is_some_and(|context| {
+                    context.accepts_handed_ops() && context.accepts_gate_claims()
+                })
         })
     } else {
         current_reaction_io_context(scope).and_then(|context| context.continuation_id())
@@ -11303,6 +11309,15 @@ impl IoContext {
     /// wakes the driver through `handed_ready` instead.
     fn has_handed_ops(&self) -> bool {
         self.handed_len.load(Ordering::Acquire) != 0
+    }
+
+    fn close_empty_handed_ops(&self) -> bool {
+        let mut handed = self.handed.lock().unwrap();
+        if handed.as_ref().is_some_and(|queue| !queue.is_empty()) {
+            return false;
+        }
+        *handed = None;
+        true
     }
 
     fn accepts_handed_ops(&self) -> bool {
