@@ -23,6 +23,17 @@ Platform Tests. Before a release, we replay storage, SQL, alarm, stream,
 WebSocket, and lifecycle scenarios through the full `celld` binary in each
 deployment mode.
 
+## Fork regression checks
+
+The WebSocket origin regression runs an isolated local runtime and exercises background socket creation through the constructor, HTTP upgrades, and Durable Object bindings, plus Worker response handoff. It needs Node.js with the built-in `WebSocket` API and esbuild.
+
+```sh
+cargo build --profile lab --locked -p celld
+CELLD_ESBUILD="$(command -v esbuild)" node --test tests/websocket-origin.test.mjs
+```
+
+Set `CELLD_BIN` to test a different runtime binary. The fixture uses a temporary directory and removes its state when the test finishes.
+
 ## Specification: exhaustive at small size
 
 The coordination protocol is specified in TLA+. Heyang Zhou wrote the

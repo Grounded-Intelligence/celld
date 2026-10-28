@@ -1,0 +1,14 @@
+{
+  "name": "websocket-origin-regression",
+  "main": "index.js",
+  "compatibility_date": "2026-08-02",
+  "durable_objects": {
+    "bindings": [
+      { "name": "ORIGIN", "class_name": "Origin" },
+      { "name": "ECHO", "class_name": "Echo" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Origin", "Echo"] }
+  ]
+}
