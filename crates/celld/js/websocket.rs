@@ -19,21 +19,24 @@ pub(super) struct WsCapture {
     promise: Option<v8::Global<v8::Promise>>,
 }
 
-fn prepare_worker_websocket_handoff(id: u64) {
+fn prepare_worker_websocket_handoff(scope: &mut v8::PinScope, id: u64) {
     let (inbound, receiver) = ws_pull_channel();
     ws_pull_register(id, receiver);
     ws_register_outbound(id, "", None);
-    ws_track_request_socket(id);
+    ws_track_request_socket(scope, id);
     let registry = ws_registry();
     let replaced = registry.lock().unwrap().worker_handoffs.insert(id, inbound);
     drop(replaced);
 }
 
-pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSocket> {
+pub(super) fn transfer_worker_websocket_handoff(
+    scope: &mut v8::PinScope,
+    id: u64,
+) -> Option<WorkerWebSocket> {
     let inbound = ws_registry().lock().unwrap().worker_handoffs.remove(&id)?;
     // The response now owns cleanup. Transfer the frame channel and request
     // ownership together so request retirement cannot close a returned socket.
-    current_context()
+    event_context(scope)
         .sockets
         .lock()
         .unwrap()
@@ -71,8 +74,8 @@ pub(super) fn ws_close_request_sockets(opened: Vec<u64>) {
 }
 
 /// Account a Worker socket to the request that opened it.
-fn ws_track_request_socket(id: u64) {
-    current_context().sockets.lock().unwrap().push(id);
+fn ws_track_request_socket(scope: &mut v8::PinScope, id: u64) {
+    event_context(scope).sockets.lock().unwrap().push(id);
 }
 
 pub(super) fn ws_capture_begin() {
@@ -299,7 +302,7 @@ pub(super) fn op_ws_prepare_worker_handoff(
         .to_integer(scope)
         .map(|n| n.value() as u64)
         .unwrap_or(0);
-    prepare_worker_websocket_handoff(id);
+    prepare_worker_websocket_handoff(scope, id);
 }
 /// The facet record of an outbound socket that `cell` opens, when the running
 /// event belongs to a Durable Object facet.
@@ -392,7 +395,7 @@ pub(super) fn op_ws_upgrade(
     let pull = cell.is_empty().then(|| {
         let (pull_tx, pull_rx) = ws_pull_channel();
         ws_pull_register(id, pull_rx);
-        ws_track_request_socket(id);
+        ws_track_request_socket(scope, id);
         pull_tx
     });
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -513,7 +516,7 @@ pub(super) fn op_ws_connect(
     let pull = cell.is_empty().then(|| {
         let (pull_tx, pull_rx) = ws_pull_channel();
         ws_pull_register(id, pull_rx);
-        ws_track_request_socket(id);
+        ws_track_request_socket(scope, id);
         pull_tx
     });
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -584,7 +587,7 @@ pub(super) fn op_ws_bind_target(
     let (pull_tx, pull_rx) = ws_pull_channel();
     ws_pull_register(id, pull_rx);
     if cell.is_empty() {
-        ws_track_request_socket(id);
+        ws_track_request_socket(scope, id);
     }
     // Registered here, on the JS thread, so a frame sent between this op and
     // the pipe task buffers as a pending frame instead of being dropped for

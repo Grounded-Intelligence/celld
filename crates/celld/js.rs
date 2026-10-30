@@ -12688,7 +12688,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         None
     } else {
         Some(
-            websocket::transfer_worker_websocket_handoff(worker_id)
+            websocket::transfer_worker_websocket_handoff(scope, worker_id)
                 .ok_or_else(|| anyhow!("Worker WebSocket {worker_id} has no frame handoff"))?,
         )
     };
