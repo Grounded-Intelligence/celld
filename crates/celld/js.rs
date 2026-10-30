@@ -9217,13 +9217,7 @@ fn op_fetch(
             finish(false, None, Some(error.clone()));
         })?;
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-        // a timeout bounds a black-hole host: the future settles (Err) instead
-        // of parking run_loop forever — the hang the Drop guard can't catch.
-        let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
-            .expect("validated CELLD_FETCH_TIMEOUT_S");
-        let mut rb = client
-            .request(m, &url)
-            .timeout(std::time::Duration::from_secs(fetch_timeout));
+        let mut rb = client.request(m, &url);
         // reqwest omits Content-Length for an empty Vec, which collapses the
         // wire representation of `Some([])` into the representation of
         // `None`. Install the zero length here unless the Worker supplied a
@@ -9258,14 +9252,25 @@ fn op_fetch(
         // connection, which is what tells the upstream to stop producing. After
         // this point the response body is a registered stream, and
         // `__http_stream_cancel` is what ends it.
+        // The timeout bounds a black-hole host until the response head, so the
+        // future settles instead of parking run_loop forever. It must not cover
+        // the body, which streams for as long as the Worker reads it.
+        let fetch_timeout = crate::env_vars::positive_or("CELLD_FETCH_TIMEOUT_S", 120)
+            .expect("validated CELLD_FETCH_TIMEOUT_S");
+        let send = async {
+            tokio::time::timeout(std::time::Duration::from_secs(fetch_timeout), rb.send())
+                .await
+                .map_err(|_| format!("fetch: no response within {fetch_timeout}s"))?
+                .map_err(|error| fetch_request_error(&error))
+        };
         let sent = match cancel {
             Some(cancel) => crate::asyncrt::select_biased! {
                 "a cancel that is ready wins a tie, so an aborted request never \
                  hands back a response and never leaves a body stream nobody reads";
                 _ = cancel => None,
-                result = rb.send() => Some(result),
+                result = send => Some(result),
             },
-            None => Some(rb.send().await),
+            None => Some(send.await),
         };
         let Some(sent) = sent else {
             let error = "fetch: the request was aborted".to_string();
@@ -9300,8 +9305,7 @@ fn op_fetch(
                 })
                 .to_string())
             }
-            Err(e) => {
-                let error = fetch_request_error(&e);
+            Err(error) => {
                 finish(false, None, Some(error.clone()));
                 Err(error)
             }
