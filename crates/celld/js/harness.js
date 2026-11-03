@@ -715,7 +715,7 @@ globalThis.fetch = async (input, init) => {
 };
 const __fetchWebSocketUpgrade = __celld.__fetchWebSocketUpgrade =
   async (req) => {
-  const scope = __currentActorScope();
+  const scope = __socketScope();
   const id = __ws_alloc();
   const socket = __makeSocket(id);
   socket._outbound = true;
@@ -2901,6 +2901,22 @@ const __currentActorEvent = () => {
   return undefined;
 };
 const __currentActorScope = () => __currentActorEvent()?.scope ?? "";
+// The frame carries the cell into every continuation an event leaves running, after the event leaves the stack.
+const __actorScopeKey = Symbol("celld.actorScope");
+const __withActorScope = (scope, fn) => {
+  const prior = __als_get();
+  const frame = new Map(prior);
+  frame.set(__actorScopeKey, scope);
+  __als_set(frame);
+  try {
+    return fn();
+  } finally {
+    __als_set(prior);
+  }
+};
+// A Durable Object's socket belongs to the object, as on Cloudflare, not to the event that started the work opening it.
+const __socketScope = () =>
+  __currentActorScope() || (__als_get()?.get(__actorScopeKey) ?? "");
 const __beginActorEvent = (scope) => {
   __rpcSignalRefresh();
   const event = { scope, context: String(__io_context_id()) };
@@ -5861,6 +5877,10 @@ __celld.__fireAlarm = async (scope, scheduledTime, retryCount) => {
     __endActorEvent(actorEvent);
   }
 };
+for (const name of ["__dispatchTo", "__dispatchRpc", "__wsOpen", "__wsMessage", "__wsBinary", "__wsClosed", "__fireAlarm"]) {
+  const dispatch = __celld[name];
+  __celld[name] = (scope, ...args) => __withActorScope(scope, () => dispatch(scope, ...args));
+}
 // The reserved cron cell. It is not a user class: celld registers it under
 // `.cron` for every deployment that declares `triggers.crons`, and one cell
 // per script carries that script's whole schedule. Ownership CAS on that one
@@ -10434,7 +10454,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
       // a hibernated cell. A Worker socket has no cell: the isolate polls it,
       // and it lives and dies with the request, which is the lifetime
       // Cloudflare gives one too.
-      const scope = __currentActorScope();
+      const scope = __socketScope();
       this._polled = !scope;
       const requested = typeof protocols === "string"
         ? [protocols]
@@ -10559,7 +10579,7 @@ globalThis.WebSocket = class WebSocket extends EventTarget {
         __ws_bind_target(
           this._id,
           JSON.stringify(this._boundTarget),
-          __currentActorScope(),
+          __socketScope(),
         );
       }
       this.readyState = WebSocket.READY_STATE_OPEN;

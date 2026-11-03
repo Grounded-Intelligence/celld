@@ -74,4 +74,18 @@ test("background continuations retain their WebSockets after the delivering even
       assert.deepEqual(results, Array.from({ length: 20 }, () => ({ echo: "command-check" })));
     });
   }
+
+  for (const settle of ["short", "none"]) {
+    await t.test(`detached work outlives its event (${settle})`, async () => {
+      const query = new URLSearchParams({ id: `detached-${settle}`, settle });
+      assert.equal((await fetch(`${base}/detached?${query}`)).status, 200);
+      let results = [];
+      for (let attempt = 0; attempt < 200; attempt++) {
+        results = await (await fetch(`${base}/results?${query}`, { signal: AbortSignal.timeout(1000) })).json();
+        if (results.length === 10 || results.some((result) => result.error)) break;
+        await delay(25);
+      }
+      assert.deepEqual(results, Array.from({ length: 10 }, () => ({ echo: "ping" })));
+    });
+  }
 });
