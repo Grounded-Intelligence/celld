@@ -68,7 +68,7 @@ jobs:
           gzip -9 -n -c target/release/celld \
             > "out/celld-${{ matrix.target }}.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: celld-${{ matrix.target }}
           path: out/celld-${{ matrix.target }}.gz
@@ -121,7 +121,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: assets
           merge-multiple: true
