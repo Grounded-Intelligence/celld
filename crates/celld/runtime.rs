@@ -413,6 +413,17 @@ impl AlarmRequestRegistry {
         }
     }
 
+    fn active(&self, cell: &str) -> Vec<js::RequestId> {
+        self.states
+            .iter()
+            .filter(|((scope, _), _)| scope == cell)
+            .filter_map(|(_, state)| match state {
+                AlarmRequestState::Active(request) => Some(*request),
+                AlarmRequestState::PendingAbort | AlarmRequestState::Completed => None,
+            })
+            .collect()
+    }
+
     fn aborting(&mut self, cell: &str, op: celld_logic::OpId) -> Option<js::RequestId> {
         let key = (cell.to_string(), op);
         match self.states.get(&key).copied() {
@@ -1437,6 +1448,7 @@ impl RuntimeManager {
                 }
             }
         }
+        self.end_leftover_alarm_work(cell).await?;
         for handle in stopped {
             // Give the cell back rather than shutting the isolate down: it
             // serves other cells. Taking the isolate for this turn is the
@@ -1764,6 +1776,45 @@ impl RuntimeManager {
                 ))
             }
         }
+    }
+
+    /// Cancel the work `cell`'s alarm handlers left pending and wait for it
+    /// to end. That work outlives the alarm's settlement, so the core can
+    /// evict the cell under it, and closing SQLite first turns its next
+    /// storage call into `no db`, or lets it write into the next activation.
+    async fn end_leftover_alarm_work(&self, cell: &str) -> anyhow::Result<()> {
+        let requests = self
+            .alarm_requests
+            .lock()
+            .expect("alarm registry poisoned")
+            .active(cell);
+        if requests.is_empty() {
+            return Ok(());
+        }
+        for &request in &requests {
+            js::abort_request_for_shutdown(request);
+        }
+        let deadline = Duration::from_millis(crate::actor::operation_deadline_ms()?);
+        let ended = async {
+            while self
+                .alarm_requests
+                .lock()
+                .expect("alarm registry poisoned")
+                .active(cell)
+                .iter()
+                .any(|request| requests.contains(request))
+            {
+                asyncrt::sleep(CANCELLATION_TICK).await;
+            }
+        };
+        if tokio::time::timeout(deadline, ended).await.is_err() {
+            tracing::warn!(
+                event = "alarm_leftover_work_outlived_stop",
+                %cell,
+                "work an alarm handler left pending did not end before its cell stopped"
+            );
+        }
+        Ok(())
     }
 
     pub fn abort_alarm(&self, cell: &str, op: celld_logic::OpId) {
