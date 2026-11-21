@@ -101,9 +101,13 @@ fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -
         .unwrap_or_default();
     CgroupMemory {
         current_bytes,
+        // The files are separate kernel snapshots. If the combined file charge
+        // races above the earlier current charge, zero would hide all active
+        // memory from the ordinary pressure and rollout gates.
         working_set_bytes: current_bytes
-            .saturating_sub(active_file_bytes)
-            .saturating_sub(inactive_file_bytes),
+            .checked_sub(active_file_bytes)
+            .and_then(|remaining| remaining.checked_sub(inactive_file_bytes))
+            .unwrap_or(current_bytes),
     }
 }
 
@@ -364,7 +368,7 @@ mod tests {
             ("active_file 600\n", "inactive_file", 400),
             ("inactive_file 200\n", "inactive_file", 800),
             ("active_file invalid\ninactive_file 200\n", "inactive_file", 800),
-            ("active_file 900\ninactive_file 200\n", "inactive_file", 0),
+            ("active_file 900\ninactive_file 200\n", "inactive_file", 1000),
         ] {
             let memory = cgroup_memory_from_stat(1000, stat, key);
             assert_eq!(memory.working_set_bytes, expected, "{stat:?}");
