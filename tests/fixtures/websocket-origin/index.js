@@ -95,7 +95,10 @@ export class Echo {
     this.state = state;
   }
 
-  fetch() {
+  async fetch(request) {
+    if (request.headers.get("Upgrade") === null) {
+      return Response.json(await this.state.storage.get("termination") ?? null);
+    }
     const [client, server] = new WebSocketPair();
     this.state.acceptWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
@@ -104,6 +107,14 @@ export class Echo {
   webSocketMessage(socket, message) {
     socket.send(message);
     socket.close(1000, "done");
+  }
+
+  webSocketClose(_socket, code, _reason, wasClean) {
+    return this.state.storage.put("termination", { kind: "close", code, wasClean });
+  }
+
+  webSocketError(_socket, error) {
+    return this.state.storage.put("termination", { kind: "error", message: error.message });
   }
 }
 
@@ -118,6 +129,9 @@ export default {
       return new Response(null, { status: 101, webSocket: client });
     }
     if (url.pathname === "/echo") return env.ECHO.getByName("echo").fetch(request);
+    if (url.pathname === "/echo-termination") {
+      return env.ECHO.getByName(url.searchParams.get("id")).fetch(request);
+    }
     return env.ORIGIN.getByName(url.searchParams.get("id")).fetch(request);
   },
 };

@@ -816,7 +816,7 @@ where
     F: FnMut(celld::js::WsIn) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    use fastwebsockets::{FragmentCollectorRead, Frame as WsFrame, OpCode, Payload};
+    use fastwebsockets::{FragmentCollectorRead, Frame as WsFrame, OpCode, Payload, WebSocketError};
 
     let (reader, writer) = socket.split(tokio::io::split);
     let mut reader = FragmentCollectorRead::new(reader);
@@ -846,8 +846,20 @@ where
 
         let read = async {
             loop {
-                let Ok(frame) = reader.read_frame(&mut obligated).await else {
-                    return None;
+                let frame = match reader.read_frame(&mut obligated).await {
+                    Ok(frame) => frame,
+                    Err(WebSocketError::UnexpectedEOF | WebSocketError::ConnectionClosed) => {
+                        return None;
+                    }
+                    Err(WebSocketError::IoError(error)) if is_websocket_disconnect(&error) => {
+                        return None;
+                    }
+                    Err(error) => {
+                        return Some(PumpClose {
+                            state: (1006, error.to_string(), false),
+                            initiator: CloseInitiator::Transport,
+                        });
+                    }
                 };
                 let delivered = match frame.opcode {
                     OpCode::Text => {
@@ -918,6 +930,18 @@ where
         }
     }
     (close, writer)
+}
+
+fn is_websocket_disconnect(error: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    )
 }
 
 /// Carry a client socket into the top-level Worker request that returned it.
