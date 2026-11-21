@@ -5852,13 +5852,10 @@ __celld.__wsClosed = async (scope, wsId, code, reason, wasClean) => {
     const socket = inst.__celldState._socket(wsId);
     if (!socket._hibernatable && typeof socket._dispatchClose === "function")
       socket._dispatchClose(code, reason, wasClean);
-    else if (!wasClean && typeof inst.webSocketError === "function")
-      // A hibernatable socket reports an abnormal closure through
-      // webSocketError, which celld listed as a handler name and never
-      // called.
+    else if (!wasClean && reason && typeof inst.webSocketError === "function")
       await inst.webSocketError(
         socket,
-        new Error(reason ? `WebSocket closed abnormally: ${reason}` : "WebSocket closed abnormally"),
+        new Error(`WebSocket closed abnormally: ${reason}`),
       );
     else if (typeof inst.webSocketClose === "function")
       await inst.webSocketClose(socket, code, reason, wasClean);

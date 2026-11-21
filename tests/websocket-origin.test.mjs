@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { cp, mkdtemp, rm } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -46,6 +46,38 @@ test("background continuations retain their WebSockets after the delivering even
     await delay(50);
   }
   assert.ok(ready, `runtime did not start: ${logs}`);
+
+  await t.test("a hibernatable WebSocket disconnect still runs the close handler", async (t) => {
+    const path = "/echo-termination?id=unclean";
+    const socket = createConnection(port, "127.0.0.1");
+    t.after(() => socket.destroy());
+    await once(socket, "connect");
+    socket.write([
+      `GET ${path} HTTP/1.1`,
+      `Host: 127.0.0.1:${port}`,
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      "Sec-WebSocket-Version: 13",
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+      "",
+      "",
+    ].join("\r\n"));
+    let response = "";
+    for await (const chunk of socket) {
+      response += chunk;
+      if (response.includes("\r\n\r\n")) break;
+    }
+    assert.match(response, /^HTTP\/1\.1 101 /);
+    socket.destroy();
+
+    let termination;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      termination = await (await fetch(`${base}${path}`)).json();
+      if (termination !== null) break;
+      await delay(25);
+    }
+    assert.deepEqual(termination, { kind: "close", code: 1006, wasClean: false });
+  });
 
   await t.test("Worker response transfers socket ownership", async () => {
     const socket = new WebSocket(`${base.replace("http:", "ws:")}/worker-echo`);
