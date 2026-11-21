@@ -3799,6 +3799,11 @@ impl InFlight {
         self.request_id
     }
 
+    /// The cell this event belongs to, and `None` for stateless work.
+    pub(crate) fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
     /// The request is over and its remaining ops are being dropped. Purge
     /// their resolvers.
     ///
