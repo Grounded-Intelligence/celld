@@ -1807,7 +1807,13 @@ impl RuntimeManager {
                 asyncrt::sleep(CANCELLATION_TICK).await;
             }
         };
-        if tokio::time::timeout(deadline, ended).await.is_err() {
+        if tokio::time::timeout(deadline, ended).await.is_ok() {
+            // A drive that retired between the snapshot and the abort has
+            // already cleared its cancellation, so nothing else would.
+            for request in requests {
+                js::clear_request_cancellation(request);
+            }
+        } else {
             tracing::warn!(
                 event = "alarm_leftover_work_outlived_stop",
                 %cell,
