@@ -4,7 +4,7 @@
 //!
 //! Process RSS and cgroup memory answer different questions. RSS describes the
 //! process, while `memory.current` is the complete charge that the kernel
-//! constrains. `memory.stat` identifies inactive file pages that the kernel can
+//! constrains. `memory.stat` identifies active and inactive file pages the kernel can
 //! reclaim, so the ordinary pressure measurement does not treat that cache as
 //! a cell working set. [`sample`] obtains the measurements in one sampling
 //! turn and keeps their relationship intact.
@@ -68,7 +68,7 @@ fn cgroup_memory() -> Option<CgroupMemory> {
     None
 }
 
-#[cfg(any(target_os = "linux", all(test, celld_internal_tests)))]
+#[cfg(any(target_os = "linux", test))]
 fn memory_stat_value(stat: &str, key: &str) -> Option<u64> {
     stat.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -78,8 +78,20 @@ fn memory_stat_value(stat: &str, key: &str) -> Option<u64> {
     })
 }
 
-#[cfg(any(target_os = "linux", all(test, celld_internal_tests)))]
+#[cfg(any(target_os = "linux", test))]
 fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -> CgroupMemory {
+    let active_key = if inactive_key == "total_inactive_file" {
+        "total_active_file"
+    } else {
+        "active_file"
+    };
+    let active_file_bytes = memory_stat_value(stat, active_key)
+        .or_else(|| {
+            (active_key == "total_active_file")
+                .then(|| memory_stat_value(stat, "active_file"))
+                .flatten()
+        })
+        .unwrap_or_default();
     let inactive_file_bytes = memory_stat_value(stat, inactive_key)
         .or_else(|| {
             (inactive_key == "total_inactive_file")
@@ -89,12 +101,9 @@ fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -
         .unwrap_or_default();
     CgroupMemory {
         current_bytes,
-        // The files are separate kernel snapshots. If the inactive charge
-        // races above the earlier current charge, using zero would hide all
-        // active memory from the ordinary pressure and rollout gates.
         working_set_bytes: current_bytes
-            .checked_sub(inactive_file_bytes)
-            .unwrap_or(current_bytes),
+            .saturating_sub(active_file_bytes)
+            .saturating_sub(inactive_file_bytes),
     }
 }
 
@@ -338,4 +347,53 @@ pub fn tune_allocator() {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_MEMORY_TESTS"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cgroup_memory_from_stat;
+    use celld_logic::pressure::{Latches, Load, PressureConfig, SHED_RSS_HARD};
+
+    #[test]
+    fn ordinary_cgroup_memory_excludes_active_and_inactive_file_cache() {
+        for (stat, key, expected) in [
+            ("active_file 600\ninactive_file 200\nfile 950\nshmem 150\n", "inactive_file", 200),
+            ("total_active_file 600\ntotal_inactive_file 200\nactive_file 10\ninactive_file 20\n", "total_inactive_file", 200),
+            ("active_file 600\ninactive_file 200\n", "total_inactive_file", 200),
+            ("", "inactive_file", 1000),
+            ("active_file 600\n", "inactive_file", 400),
+            ("inactive_file 200\n", "inactive_file", 800),
+            ("active_file invalid\ninactive_file 200\n", "inactive_file", 800),
+            ("active_file 900\ninactive_file 200\n", "inactive_file", 0),
+        ] {
+            let memory = cgroup_memory_from_stat(1000, stat, key);
+            assert_eq!(memory.working_set_bytes, expected, "{stat:?}");
+            assert_eq!(memory.current_bytes, 1000);
+        }
+    }
+
+    #[test]
+    fn file_cache_does_not_shed_until_the_full_cgroup_charge_hits_the_hard_cap() {
+        let config = PressureConfig::from_limits(Some(1000), None);
+        for (current, expected) in [(900, None), (950, Some(SHED_RSS_HARD))] {
+            let memory = cgroup_memory_from_stat(
+                current,
+                "active_file 700\ninactive_file 50\n",
+                "inactive_file",
+            );
+            let load = Load {
+                resident_cells: 1,
+                rss_bytes: 100,
+                in_use_bytes: 100,
+                cgroup_working_set_bytes: Some(memory.working_set_bytes),
+                cgroup_current_bytes: Some(memory.current_bytes),
+                container_reserved_bytes: 0,
+            };
+            let (latches, reason) = config.classify(load, Latches::default());
+            assert!(!latches.memory);
+            assert_eq!(latches.rss_hard, expected.is_some());
+            assert_eq!(reason, expected);
+            assert_eq!(load.hard_bytes(), current);
+        }
+    }
 }

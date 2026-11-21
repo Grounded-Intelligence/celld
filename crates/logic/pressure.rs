@@ -24,9 +24,9 @@ pub struct PressureConfig {
     /// An absolute ceiling on the cgroup charge, or process RSS when the
     /// process has no readable cgroup: 95% of the available memory.
     ///
-    /// `high_bytes` applies to allocator-adjusted RSS and to the active cgroup
-    /// working set after the same allocator adjustment. The adjustment lets a
-    /// node recover after a free, and the cgroup measurement includes active
+    /// `high_bytes` applies to allocator-adjusted RSS and to the cgroup charge
+    /// excluding file cache after the same allocator adjustment. This lets a
+    /// node recover after a free, and the cgroup measurement includes
     /// kernel charges outside RSS. Neither measurement includes every charge
     /// that the cgroup limit uses.
     ///
@@ -65,8 +65,8 @@ pub struct Latches {
 /// may never move the complete cgroup charge at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
-    /// The greater of allocator-adjusted RSS and the allocator-adjusted active
-    /// cgroup working set. An eviction can return this memory.
+    /// The greater of allocator-adjusted RSS and the allocator-adjusted
+    /// cgroup charge excluding file cache. An eviction can return this memory.
     InUse,
     /// The complete cgroup charge, with process RSS as a host fallback.
     Rss,
@@ -83,8 +83,8 @@ pub struct Load {
     /// RSS minus the pages the allocator keeps but nothing uses. This is the
     /// ordinary pressure fallback when no cgroup working set is readable.
     pub in_use_bytes: u64,
-    /// The cgroup charge after inactive file pages from `memory.stat` are
-    /// removed. `None` outside a readable Linux memory cgroup.
+    /// The cgroup charge after active and inactive file pages from `memory.stat`
+    /// are removed, retaining shmem/tmpfs. `None` outside a readable Linux memory cgroup.
     pub cgroup_working_set_bytes: Option<u64>,
     /// The complete `memory.current` charge. This is the number the cgroup
     /// limit constrains, including charges that process RSS does not contain.
@@ -103,9 +103,9 @@ pub struct Load {
 }
 
 impl Load {
-    /// The ordinary pressure measurement. A cgroup working set contains active
-    /// kernel charges that process RSS omits. Subtract the same measured
-    /// allocator slack from it, or retained pages would recreate the admission
+    /// The ordinary pressure measurement excludes reclaimable file cache but
+    /// retains shmem/tmpfs and kernel charges that process RSS omits. Subtract
+    /// the same measured allocator slack, or retained pages would recreate the admission
     /// wedge through the cgroup path. The process measurement remains the floor
     /// because cgroup and RSS accounting can differ for shared pages.
     pub fn memory_bytes(self) -> u64 {
