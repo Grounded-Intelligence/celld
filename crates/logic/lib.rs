@@ -631,12 +631,8 @@ impl Default for Cell {
 /// flat by coincidence.
 #[derive(Clone, Copy, Debug)]
 struct ShedCut {
-    /// The measurement `bytes` was read from.
     metric: pressure::Metric,
-    /// What that measurement said at the cut.
-    bytes: u64,
-    /// The residency the cut was taken at.
-    cells: usize,
+    load: pressure::Load,
 }
 
 /// All authoritative coordination state for the first vertical slice.
@@ -6183,8 +6179,9 @@ impl State {
             // from a measurement that no longer describes the node, so take a
             // fresh baseline. The band absorbs the jitter of a live sample and
             // decides nothing about what a cut must achieve.
-            let rose = sample_bytes > cut.bytes.saturating_add(cut.bytes / 100);
-            if cut_landed && !rose && !self.shedding_can_reach_resume_line(cut, sample_bytes) {
+            let cut_bytes = cut.load.metric_bytes(metric);
+            let rose = sample_bytes > cut_bytes.saturating_add(cut_bytes / 100);
+            if cut_landed && !rose && !self.shedding_can_reach_resume_line(cut, load) {
                 return;
             }
         }
@@ -6192,11 +6189,7 @@ impl State {
         // of what was just measured, because the effect of an eviction on the
         // sample is not visible until the next one.
         self.shed_floor = pressure::PressureConfig::release_target(load.resident_cells);
-        self.shed_cut = Some(ShedCut {
-            metric,
-            bytes: sample_bytes,
-            cells: load.resident_cells,
-        });
+        self.shed_cut = Some(ShedCut { metric, load });
         self.shed_toward_floor(effects);
     }
 
@@ -6241,13 +6234,7 @@ impl State {
     /// a stop takes no fresh baseline: the sample keeps falling against the
     /// bytes of the last cut until the memory that came back late has landed
     /// against it.
-    fn shedding_can_reach_resume_line(&self, cut: ShedCut, sample_bytes: u64) -> bool {
-        let Some(resume_line) = self.config.pressure.resume_line(cut.metric) else {
-            // Unreachable: `walk_metric` only names a measurement whose ceiling
-            // is configured. With no line, the safe answer is that shedding
-            // buys nothing, so the caller keeps the working set.
-            return false;
-        };
+    fn shedding_can_reach_resume_line(&self, cut: ShedCut, load: pressure::Load) -> bool {
         // The projection below prices the next cut from the last one, which
         // only holds while every cut is worth the same. It is not: a cut that
         // takes an isolate's last cell returns that heap, and the heap is
@@ -6257,34 +6244,9 @@ impl State {
         if self.can_empty_an_isolate() {
             return true;
         }
-        let removed = cut.cells.saturating_sub(self.occupied());
-        if removed == 0 {
-            // Only a node holding nothing arrives here. Reaching this call
-            // means `occupied` is at or below `release_target(cut.cells)`,
-            // which sits strictly below `cut.cells` for any residency but
-            // zero, so zero is the one residency where a cut can vacate
-            // nothing and still be measured. It vacated nothing because there
-            // was nothing to vacate, so there is no yield to project and the
-            // division below would be by zero.
-            //
-            // Such a node is over its ceiling on memory no cell owns, and it
-            // holds no cell to spend on the crossing. The two answers here
-            // therefore differ only in which sample the baseline remembers,
-            // and neither changes what the node does. This one lets the walk
-            // down carry on, the way the isolate arm above does.
-            return true;
-        }
-        let returned = cut.bytes.saturating_sub(sample_bytes);
-        // One division, at the end: a per-cell yield rounded to a whole number
-        // first is zero for any cell worth less than a byte more than the
-        // rounding, which reports every walk down on a large node as futile.
-        let projected = u128::from(returned).saturating_mul(self.occupied() as u128)
-            / u128::from(removed as u64);
-        let floor = u128::from(sample_bytes).saturating_sub(projected);
-        // Inclusive: `classify` holds the latch only *above* the low watermark,
-        // so a projection landing exactly on the line reaches a node that
-        // releases. A strict `<` here wedges that node.
-        floor <= u128::from(resume_line)
+        self.config
+            .pressure
+            .can_reach_resume_line(cut.metric, cut.load, load, self.occupied())
     }
 
     /// Continue a latched walk down as each eviction lands.

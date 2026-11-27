@@ -356,7 +356,7 @@ mod internal_tests {
 #[cfg(test)]
 mod tests {
     use super::cgroup_memory_from_stat;
-    use celld_logic::pressure::{Latches, Load, PressureConfig, SHED_RSS_HARD};
+    use celld_logic::pressure::{Latches, Load, Metric, PressureConfig, SHED_RSS_HARD};
 
     #[test]
     fn ordinary_cgroup_memory_excludes_active_and_inactive_file_cache() {
@@ -399,5 +399,107 @@ mod tests {
             assert_eq!(reason, expected);
             assert_eq!(load.hard_bytes(), current);
         }
+    }
+
+    #[test]
+    fn hard_cap_releases_early_only_with_low_cache_adjusted_pressure() {
+        let config = PressureConfig::from_limits(Some(1000), None);
+        let load = |raw, working_set| Load {
+            resident_cells: 1,
+            rss_bytes: 100,
+            in_use_bytes: 100,
+            cgroup_working_set_bytes: Some(working_set),
+            cgroup_current_bytes: Some(raw),
+            container_reserved_bytes: 0,
+        };
+        let hard_only = Latches {
+            rss_hard: true,
+            ..Latches::default()
+        };
+        let (mut latches, _) = config.classify(load(949, 200), Latches::default());
+        assert_eq!(latches, Latches::default());
+        for (raw, working_set, resume_line, expected) in [
+            (950, 200, 900, Some(SHED_RSS_HARD)),
+            (901, 200, 900, Some(SHED_RSS_HARD)),
+            (900, 700, 760, Some(SHED_RSS_HARD)),
+            (900, 640, 760, Some(SHED_RSS_HARD)),
+            (900, 639, 900, None),
+            (949, 200, 900, None),
+            (950, 200, 900, Some(SHED_RSS_HARD)),
+            (760, 700, 760, None),
+        ] {
+            let sample = load(raw, working_set);
+            assert_eq!(config.resume_line(Metric::Rss, sample), Some(resume_line));
+            let (next, reason) = config.classify(sample, latches);
+            assert_eq!(reason, expected, "{sample:?}");
+            assert_eq!(
+                next,
+                if expected.is_some() {
+                    hard_only
+                } else {
+                    Latches::default()
+                }
+            );
+            latches = next;
+        }
+        assert!(!config.has_headroom(load(900, 200)));
+        assert!(config.has_headroom(load(760, 200)));
+    }
+
+    #[test]
+    fn hard_cap_futility_accounts_for_projected_cache_adjusted_pressure() {
+        let config = PressureConfig::from_limits(Some(1000), None);
+        let load = |resident_cells, raw, working_set| Load {
+            resident_cells,
+            rss_bytes: 100,
+            in_use_bytes: 100,
+            cgroup_working_set_bytes: Some(working_set),
+            cgroup_current_bytes: Some(raw),
+            container_reserved_bytes: 0,
+        };
+        let cut = load(10, 950, 700);
+        let sample = load(9, 944, 690);
+        let (latched, _) = config.classify(cut, Latches::default());
+        assert_eq!(config.classify(sample, latched).1, Some(SHED_RSS_HARD));
+        assert_eq!(config.resume_line(Metric::Rss, sample), Some(760));
+        assert_eq!(config.classify(load(0, 890, 600), latched).1, None);
+        assert!(config.can_reach_resume_line(Metric::Rss, cut, sample, 9));
+        assert!(!config.can_reach_resume_line(Metric::Rss, cut, load(9, 946, 690), 9));
+        assert!(!config.can_reach_resume_line(Metric::Rss, cut, load(9, 944, 694), 9));
+    }
+
+    #[test]
+    fn hard_cap_futility_preserves_the_projected_process_memory_floor() {
+        let config = PressureConfig::from_limits(Some(1000), None);
+        let cut = Load {
+            resident_cells: 10,
+            rss_bytes: 650,
+            in_use_bytes: 650,
+            cgroup_working_set_bytes: Some(700),
+            cgroup_current_bytes: Some(950),
+            container_reserved_bytes: 0,
+        };
+        let sample = Load {
+            resident_cells: 9,
+            cgroup_working_set_bytes: Some(690),
+            cgroup_current_bytes: Some(944),
+            ..cut
+        };
+        let projected = Load {
+            resident_cells: 0,
+            cgroup_working_set_bytes: Some(600),
+            cgroup_current_bytes: Some(890),
+            ..sample
+        };
+        let (latched, _) = config.classify(cut, Latches::default());
+        assert_eq!(config.classify(projected, latched).1, Some(SHED_RSS_HARD));
+        assert!(!config.can_reach_resume_line(Metric::Rss, cut, sample, 9));
+
+        let lower_process_memory = Load {
+            rss_bytes: 648,
+            in_use_bytes: 648,
+            ..sample
+        };
+        assert!(config.can_reach_resume_line(Metric::Rss, cut, lower_process_memory, 9));
     }
 }
