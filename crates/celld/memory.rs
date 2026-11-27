@@ -356,7 +356,7 @@ mod internal_tests {
 #[cfg(test)]
 mod tests {
     use super::cgroup_memory_from_stat;
-    use celld_logic::pressure::{Latches, Load, PressureConfig, SHED_RSS_HARD};
+    use celld_logic::pressure::{Latches, Load, Metric, PressureConfig, SHED_RSS_HARD};
 
     #[test]
     fn ordinary_cgroup_memory_excludes_active_and_inactive_file_cache() {
@@ -399,5 +399,50 @@ mod tests {
             assert_eq!(reason, expected);
             assert_eq!(load.hard_bytes(), current);
         }
+    }
+
+    #[test]
+    fn hard_cap_releases_early_only_with_low_cache_adjusted_pressure() {
+        let config = PressureConfig::from_limits(Some(1000), None);
+        let load = |raw, working_set| Load {
+            resident_cells: 1,
+            rss_bytes: 100,
+            in_use_bytes: 100,
+            cgroup_working_set_bytes: Some(working_set),
+            cgroup_current_bytes: Some(raw),
+            container_reserved_bytes: 0,
+        };
+        let hard_only = Latches {
+            rss_hard: true,
+            ..Latches::default()
+        };
+        let (mut latches, _) = config.classify(load(949, 200), Latches::default());
+        assert_eq!(latches, Latches::default());
+        for (raw, working_set, resume_line, expected) in [
+            (950, 200, 900, Some(SHED_RSS_HARD)),
+            (901, 200, 900, Some(SHED_RSS_HARD)),
+            (900, 700, 760, Some(SHED_RSS_HARD)),
+            (900, 640, 760, Some(SHED_RSS_HARD)),
+            (900, 639, 900, None),
+            (949, 200, 900, None),
+            (950, 200, 900, Some(SHED_RSS_HARD)),
+            (760, 700, 760, None),
+        ] {
+            let sample = load(raw, working_set);
+            assert_eq!(config.resume_line(Metric::Rss, sample), Some(resume_line));
+            let (next, reason) = config.classify(sample, latches);
+            assert_eq!(reason, expected, "{sample:?}");
+            assert_eq!(
+                next,
+                if expected.is_some() {
+                    hard_only
+                } else {
+                    Latches::default()
+                }
+            );
+            latches = next;
+        }
+        assert!(!config.has_headroom(load(900, 200)));
+        assert!(config.has_headroom(load(760, 200)));
     }
 }

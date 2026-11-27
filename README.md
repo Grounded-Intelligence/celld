@@ -359,9 +359,10 @@ idle cells, publishes them as unowned without resetting their epochs, and
 refuses to reacquire new unowned cells. It does not shed a cell with active
 work or a live host WebSocket. A spare node receives no assignment; it
 acquires a released cell through the same bucket protocol when normal
-traffic reaches it. Each limit releases separately. The threshold releases at
-80% of its value, and the cap releases at 80% of its value. Therefore, a
-crossing of one limit does not hold the node against the other.
+traffic reaches it. Each limit releases separately at 80% of its value. The
+cap also releases when the complete cgroup charge is at or below 90% of
+available memory and cache-adjusted pressure is below the ordinary release
+line.
 
 Each isolate also has a V8 heap limit, separate from the memory of the node.
 The default is 128 MB, and it matches the limit of a Durable Object on

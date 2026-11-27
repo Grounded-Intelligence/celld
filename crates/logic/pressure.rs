@@ -144,6 +144,9 @@ pub const SHED_MEMORY: &str = "memory";
 /// but a Linux container decides it from `memory.current`.
 pub const SHED_RSS_HARD: &str = "rss-hard";
 
+const HARD_CAP_PERCENT: u64 = 95;
+const HARD_CAP_EARLY_RESUME_PERCENT: u64 = 90;
+
 impl PressureConfig {
     /// Build the watermarks from the machine and the operator's setting.
     ///
@@ -180,7 +183,7 @@ impl PressureConfig {
             // cap *below* the ceiling, which is the shape this avoids.
             let fallback = high.checked_mul(5).map_or(u64::MAX, |scaled| scaled / 4);
             let cap = total_memory_bytes
-                .and_then(|total| usable(total / 100 * 95))
+                .and_then(|total| usable(total / 100 * HARD_CAP_PERCENT))
                 .unwrap_or(fallback);
             usable(cap)
         });
@@ -206,8 +209,9 @@ impl PressureConfig {
     /// Fold a sample into the latches, and say why the node is shedding.
     ///
     /// Each ceiling latches on its own crossing: it engages at its ceiling and
-    /// releases at its own low watermark, which is 80% of that ceiling. The
-    /// hard cap is reported first, because it is the more serious of the two.
+    /// releases at its own low watermark. The hard cap can also release at
+    /// 90% of the machine when cache-adjusted pressure is low. The hard cap
+    /// is reported first, because it is the more serious of the two.
     ///
     /// The latches are carried separately and not derived from the reported
     /// reason. Sharing them lets one crossing hold the node against the other's
@@ -215,12 +219,16 @@ impl PressureConfig {
     /// holds the node on a resident-set watermark it did not cross,
     /// and a hard-cap crossing then holds it on a ceiling it never crossed.
     pub fn classify(self, s: Load, was: Latches) -> (Latches, Option<&'static str>) {
-        let over = |ceiling: Option<u64>, sample: u64, latched: bool| {
-            ceiling.is_some_and(|c| sample >= c || (latched && sample > Self::low_watermark(c)))
+        let over = |ceiling: Option<u64>, metric: Metric, latched: bool| {
+            let bytes = s.metric_bytes(metric);
+            ceiling.is_some_and(|c| {
+                bytes >= c
+                    || (latched && self.resume_line(metric, s).is_some_and(|line| bytes > line))
+            })
         };
         let latches = Latches {
-            memory: over(self.high_bytes, s.memory_bytes(), was.memory),
-            rss_hard: over(self.rss_hard_bytes, s.hard_bytes(), was.rss_hard),
+            memory: over(self.high_bytes, Metric::InUse, was.memory),
+            rss_hard: over(self.rss_hard_bytes, Metric::Rss, was.rss_hard),
         };
         let reason = if latches.rss_hard {
             Some(SHED_RSS_HARD)
@@ -232,13 +240,7 @@ impl PressureConfig {
         (latches, reason)
     }
 
-    /// The sample a latched ceiling releases at: 80% of the ceiling.
-    ///
-    /// One definition, because two callers read it. `classify` decides whether
-    /// the latch still holds, and the walk down's stopping condition asks
-    /// whether shedding can still get the sample down here. Two copies of the
-    /// arithmetic drift, and a walk down that aims at the wrong number either
-    /// stops above the line it could have reached or never stops at all.
+    /// The ordinary low watermark: 80% of the ceiling.
     fn low_watermark(ceiling: u64) -> u64 {
         ceiling.saturating_mul(4) / 5
     }
@@ -255,16 +257,26 @@ impl PressureConfig {
             && below(self.rss_hard_bytes, sample.hard_bytes())
     }
 
-    /// Where the walk down against `metric` has to get the sample to.
+    /// The release line for the latch and the walk down against `metric`.
     ///
     /// `None` means no ceiling is configured for that measurement, so nothing
     /// can latch on it and no walk down works against it.
-    pub fn resume_line(self, metric: Metric) -> Option<u64> {
-        let ceiling = match metric {
-            Metric::InUse => self.high_bytes,
-            Metric::Rss => self.rss_hard_bytes,
-        };
-        ceiling.map(Self::low_watermark)
+    pub fn resume_line(self, metric: Metric, sample: Load) -> Option<u64> {
+        match metric {
+            Metric::InUse => self.high_bytes.map(Self::low_watermark),
+            Metric::Rss => self.rss_hard_bytes.map(|ceiling| {
+                if sample.cgroup_working_set_bytes.is_some()
+                    && self
+                        .high_bytes
+                        .is_some_and(|high| sample.memory_bytes() < Self::low_watermark(high))
+                {
+                    (u128::from(ceiling) * u128::from(HARD_CAP_EARLY_RESUME_PERCENT)
+                        / u128::from(HARD_CAP_PERCENT)) as u64
+                } else {
+                    Self::low_watermark(ceiling)
+                }
+            }),
+        }
     }
 
     /// Which measurement the walk down must work against, given the latches.

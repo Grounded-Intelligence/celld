@@ -6184,7 +6184,7 @@ impl State {
             // fresh baseline. The band absorbs the jitter of a live sample and
             // decides nothing about what a cut must achieve.
             let rose = sample_bytes > cut.bytes.saturating_add(cut.bytes / 100);
-            if cut_landed && !rose && !self.shedding_can_reach_resume_line(cut, sample_bytes) {
+            if cut_landed && !rose && !self.shedding_can_reach_resume_line(cut, load) {
                 return;
             }
         }
@@ -6241,8 +6241,8 @@ impl State {
     /// a stop takes no fresh baseline: the sample keeps falling against the
     /// bytes of the last cut until the memory that came back late has landed
     /// against it.
-    fn shedding_can_reach_resume_line(&self, cut: ShedCut, sample_bytes: u64) -> bool {
-        let Some(resume_line) = self.config.pressure.resume_line(cut.metric) else {
+    fn shedding_can_reach_resume_line(&self, cut: ShedCut, load: pressure::Load) -> bool {
+        let Some(resume_line) = self.config.pressure.resume_line(cut.metric, load) else {
             // Unreachable: `walk_metric` only names a measurement whose ceiling
             // is configured. With no line, the safe answer is that shedding
             // buys nothing, so the caller keeps the working set.
@@ -6274,6 +6274,7 @@ impl State {
             // down carry on, the way the isolate arm above does.
             return true;
         }
+        let sample_bytes = load.metric_bytes(cut.metric);
         let returned = cut.bytes.saturating_sub(sample_bytes);
         // One division, at the end: a per-cell yield rounded to a whole number
         // first is zero for any cell worth less than a byte more than the
@@ -6281,7 +6282,7 @@ impl State {
         let projected = u128::from(returned).saturating_mul(self.occupied() as u128)
             / u128::from(removed as u64);
         let floor = u128::from(sample_bytes).saturating_sub(projected);
-        // Inclusive: `classify` holds the latch only *above* the low watermark,
+        // Inclusive: `classify` holds the latch only *above* the release line,
         // so a projection landing exactly on the line reaches a node that
         // releases. A strict `<` here wedges that node.
         floor <= u128::from(resume_line)
