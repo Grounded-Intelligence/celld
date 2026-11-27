@@ -25,10 +25,10 @@ pub use crate::engine_api::ServiceFetch;
 pub use crate::ltx_replication::Replication;
 use anyhow::{anyhow, Context};
 use futures_util::StreamExt as _;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const REMOTE_ABORT_TTL: Duration = Duration::from_secs(600);
@@ -1437,6 +1437,7 @@ impl RuntimeManager {
                 }
             }
         }
+        end_leftover_work(cell).await?;
         for handle in stopped {
             // Give the cell back rather than shutting the isolate down: it
             // serves other cells. Taking the isolate for this turn is the
@@ -2362,6 +2363,87 @@ fn take_cancellation_wake(request_id: Option<js::RequestId>) -> Option<Wake> {
     })
 }
 
+/// Cells a stop is retiring, and how many answered events of each still run
+/// work they left behind (`waitUntil`, or I/O a completed cell event keeps).
+#[derive(Default)]
+struct LeftoverWork {
+    live: HashMap<String, usize>,
+    stopping: HashSet<String>,
+}
+
+fn leftover_work() -> std::sync::MutexGuard<'static, LeftoverWork> {
+    static WORK: OnceLock<Mutex<LeftoverWork>> = OnceLock::new();
+    WORK.get_or_init(Mutex::default)
+        .lock()
+        .expect("leftover work registry poisoned")
+}
+
+/// Wakes answered events that wait on nothing else when a stop begins.
+fn leftover_stop() -> &'static tokio::sync::Notify {
+    static STOP: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    STOP.get_or_init(tokio::sync::Notify::new)
+}
+
+/// One answered event of a cell whose leftover work still runs.
+struct LeftoverGuard(String);
+
+impl LeftoverGuard {
+    fn new(cell: &str) -> Self {
+        *leftover_work().live.entry(cell.to_string()).or_default() += 1;
+        Self(cell.to_string())
+    }
+}
+
+impl Drop for LeftoverGuard {
+    fn drop(&mut self) {
+        let mut work = leftover_work();
+        if let Some(live) = work.live.get_mut(&self.0) {
+            *live -= 1;
+            if *live == 0 {
+                work.live.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn leftover_stop_requested(entry: &js::InFlight) -> bool {
+    entry.answered()
+        && entry
+            .scope()
+            .is_some_and(|cell| leftover_work().stopping.contains(cell))
+}
+
+/// Cancel the work `cell`'s answered events left running, and wait for it to
+/// end.
+///
+/// The core sees a cell idle once its events answer, so it can evict the cell
+/// under that work. Closing SQLite first turned the work's next storage call
+/// into `no db`, or let it write into the cell's next activation on this node.
+async fn end_leftover_work(cell: &str) -> anyhow::Result<()> {
+    let running = || leftover_work().live.contains_key(cell);
+    if !running() {
+        return Ok(());
+    }
+
+    leftover_work().stopping.insert(cell.to_string());
+    leftover_stop().notify_waiters();
+    let deadline = Duration::from_millis(crate::actor::operation_deadline_ms()?);
+    let ended = async {
+        while running() {
+            asyncrt::sleep(CANCELLATION_TICK).await;
+        }
+    };
+    if tokio::time::timeout(deadline, ended).await.is_err() {
+        tracing::warn!(
+            event = "leftover_work_outlived_stop",
+            %cell,
+            "work a cell event left running did not end before its cell stopped"
+        );
+    }
+    leftover_work().stopping.remove(cell);
+    Ok(())
+}
+
 /// Wait for whichever comes first, holding no isolate.
 ///
 /// This is the whole of what a request does between turns, and it is
@@ -2472,10 +2554,15 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             // must still retire the background work before the runtime stops.
             let Some(request_id) = request_id else {
                 let context = entry.io_context();
+                let stop = leftover_stop().notified();
+                if leftover_stop_requested(entry) {
+                    return Wake::Cancelled { shutdown: true };
+                }
                 let next = asyncrt::select_biased! {
                     "an operation result wins a tie with an op another turn hands over";
                     result = ops.next() => Some(result),
                     _ = context.handed_ready() => None,
+                    () = stop => None,
                 };
                 match next {
                     Some(Some((op, result))) => return Wake::Op(op, result),
@@ -2499,6 +2586,9 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             };
             if let Some(next) = next {
                 return next;
+            }
+            if leftover_stop_requested(entry) {
+                return Wake::Cancelled { shutdown: true };
             }
             if let Some(cancelled) = take_cancellation_wake(Some(request_id)) {
                 if matches!(cancelled, Wake::Cancelled { shutdown: true }) {
@@ -3455,7 +3545,12 @@ async fn drive_cell_inner(
         notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
     }
 
+    // Held to the end, past the alarm's final storage turn below.
+    let mut leftover = None;
     while !entry.finished() {
+        if leftover.is_none() && entry.answered() {
+            leftover = entry.scope().map(LeftoverGuard::new);
+        }
         let (started, moves) = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await
         {
             Wake::Op(op, result) => {
