@@ -262,13 +262,21 @@ impl PressureConfig {
     /// `None` means no ceiling is configured for that measurement, so nothing
     /// can latch on it and no walk down works against it.
     pub fn resume_line(self, metric: Metric, sample: Load) -> Option<u64> {
+        self.resume_line_for(
+            metric,
+            sample
+                .cgroup_working_set_bytes
+                .map(|_| sample.memory_bytes()),
+        )
+    }
+
+    fn resume_line_for(self, metric: Metric, adjusted: Option<u64>) -> Option<u64> {
         match metric {
             Metric::InUse => self.high_bytes.map(Self::low_watermark),
             Metric::Rss => self.rss_hard_bytes.map(|ceiling| {
-                if sample.cgroup_working_set_bytes.is_some()
-                    && self
-                        .high_bytes
-                        .is_some_and(|high| sample.memory_bytes() < Self::low_watermark(high))
+                if adjusted
+                    .zip(self.high_bytes)
+                    .is_some_and(|(bytes, high)| bytes < Self::low_watermark(high))
                 {
                     (u128::from(ceiling) * u128::from(HARD_CAP_EARLY_RESUME_PERCENT)
                         / u128::from(HARD_CAP_PERCENT)) as u64
@@ -277,6 +285,35 @@ impl PressureConfig {
                 }
             }),
         }
+    }
+
+    /// Can the previous cut's measured yield bring the remaining cells to the release line?
+    pub fn can_reach_resume_line(
+        self,
+        metric: Metric,
+        cut: Load,
+        sample: Load,
+        remaining: usize,
+    ) -> bool {
+        let removed = cut.resident_cells.saturating_sub(remaining);
+        if removed == 0 {
+            // A landed cut can vacate nothing only when there were no cells to evict.
+            return true;
+        }
+        let project = |before: u64, now: u64| {
+            let returned = before.saturating_sub(now);
+            // Scale before dividing so sub-byte per-cell yields are not rounded away.
+            let projected = u128::from(returned) * remaining as u128 / removed as u128;
+            u128::from(now).saturating_sub(projected) as u64
+        };
+        let floor = project(cut.metric_bytes(metric), sample.metric_bytes(metric));
+        let adjusted_floor = sample.cgroup_working_set_bytes.map(|_| {
+            let now = sample.memory_bytes();
+            cut.cgroup_working_set_bytes
+                .map_or(now, |_| project(cut.memory_bytes(), now))
+        });
+        self.resume_line_for(metric, adjusted_floor)
+            .is_some_and(|line| floor <= line)
     }
 
     /// Which measurement the walk down must work against, given the latches.

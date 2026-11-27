@@ -445,4 +445,26 @@ mod tests {
         assert!(!config.has_headroom(load(900, 200)));
         assert!(config.has_headroom(load(760, 200)));
     }
+
+    #[test]
+    fn hard_cap_futility_accounts_for_projected_cache_adjusted_pressure() {
+        let config = PressureConfig::from_limits(Some(1000), None);
+        let load = |resident_cells, raw, working_set| Load {
+            resident_cells,
+            rss_bytes: 100,
+            in_use_bytes: 100,
+            cgroup_working_set_bytes: Some(working_set),
+            cgroup_current_bytes: Some(raw),
+            container_reserved_bytes: 0,
+        };
+        let cut = load(10, 950, 700);
+        let sample = load(9, 944, 690);
+        let (latched, _) = config.classify(cut, Latches::default());
+        assert_eq!(config.classify(sample, latched).1, Some(SHED_RSS_HARD));
+        assert_eq!(config.resume_line(Metric::Rss, sample), Some(760));
+        assert_eq!(config.classify(load(0, 890, 600), latched).1, None);
+        assert!(config.can_reach_resume_line(Metric::Rss, cut, sample, 9));
+        assert!(!config.can_reach_resume_line(Metric::Rss, cut, load(9, 946, 690), 9));
+        assert!(!config.can_reach_resume_line(Metric::Rss, cut, load(9, 944, 694), 9));
+    }
 }
