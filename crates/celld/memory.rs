@@ -467,4 +467,39 @@ mod tests {
         assert!(!config.can_reach_resume_line(Metric::Rss, cut, load(9, 946, 690), 9));
         assert!(!config.can_reach_resume_line(Metric::Rss, cut, load(9, 944, 694), 9));
     }
+
+    #[test]
+    fn hard_cap_futility_preserves_the_projected_process_memory_floor() {
+        let config = PressureConfig::from_limits(Some(1000), None);
+        let cut = Load {
+            resident_cells: 10,
+            rss_bytes: 650,
+            in_use_bytes: 650,
+            cgroup_working_set_bytes: Some(700),
+            cgroup_current_bytes: Some(950),
+            container_reserved_bytes: 0,
+        };
+        let sample = Load {
+            resident_cells: 9,
+            cgroup_working_set_bytes: Some(690),
+            cgroup_current_bytes: Some(944),
+            ..cut
+        };
+        let projected = Load {
+            resident_cells: 0,
+            cgroup_working_set_bytes: Some(600),
+            cgroup_current_bytes: Some(890),
+            ..sample
+        };
+        let (latched, _) = config.classify(cut, Latches::default());
+        assert_eq!(config.classify(projected, latched).1, Some(SHED_RSS_HARD));
+        assert!(!config.can_reach_resume_line(Metric::Rss, cut, sample, 9));
+
+        let lower_process_memory = Load {
+            rss_bytes: 648,
+            in_use_bytes: 648,
+            ..sample
+        };
+        assert!(config.can_reach_resume_line(Metric::Rss, cut, lower_process_memory, 9));
+    }
 }

@@ -109,14 +109,15 @@ impl Load {
     /// wedge through the cgroup path. The process measurement remains the floor
     /// because cgroup and RSS accounting can differ for shared pages.
     pub fn memory_bytes(self) -> u64 {
-        let allocator_slack = self.rss_bytes.saturating_sub(self.in_use_bytes);
-        let cgroup_in_use = self
-            .cgroup_working_set_bytes
-            .unwrap_or_default()
-            .saturating_sub(allocator_slack);
         self.in_use_bytes
-            .max(cgroup_in_use)
+            .max(self.cgroup_in_use_bytes().unwrap_or_default())
             .saturating_add(self.container_reserved_bytes)
+    }
+
+    fn cgroup_in_use_bytes(self) -> Option<u64> {
+        let allocator_slack = self.rss_bytes.saturating_sub(self.in_use_bytes);
+        self.cgroup_working_set_bytes
+            .map(|bytes| bytes.saturating_sub(allocator_slack))
     }
 
     /// The hard pressure measurement. `memory.current` is authoritative when
@@ -307,10 +308,20 @@ impl PressureConfig {
             u128::from(now).saturating_sub(projected) as u64
         };
         let floor = project(cut.metric_bytes(metric), sample.metric_bytes(metric));
-        let adjusted_floor = sample.cgroup_working_set_bytes.map(|_| {
-            let now = sample.memory_bytes();
-            cut.cgroup_working_set_bytes
-                .map_or(now, |_| project(cut.memory_bytes(), now))
+        let adjusted_floor = sample.cgroup_in_use_bytes().map(|cgroup_now| {
+            cut.cgroup_in_use_bytes().map_or_else(
+                || sample.memory_bytes(),
+                |cgroup_before| {
+                    let project_committed = |before: u64, now: u64| {
+                        project(
+                            before.saturating_add(cut.container_reserved_bytes),
+                            now.saturating_add(sample.container_reserved_bytes),
+                        )
+                    };
+                    project_committed(cgroup_before, cgroup_now)
+                        .max(project_committed(cut.in_use_bytes, sample.in_use_bytes))
+                },
+            )
         });
         self.resume_line_for(metric, adjusted_floor)
             .is_some_and(|line| floor <= line)
